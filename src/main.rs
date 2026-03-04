@@ -197,7 +197,10 @@ impl App {
                 display_text = Some(text);
                 display_is_stream = true;
             } else if self.show_all_messages {
-                display_text = Some(line.clone());
+                let event = value.get("event").and_then(|v| v.as_str());
+                if event != Some("chat") {
+                    display_text = Some(line.clone());
+                }
             }
             if let Some(val) = value.get("type").and_then(|v| v.as_str()) {
                 event_type = val.to_string();
@@ -1586,11 +1589,15 @@ fn render_health(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let mut lines = Vec::new();
-    let max_lines = area.height.saturating_sub(2) as usize;
-    let start = app.transcript.len().saturating_sub(max_lines);
-    for line in app.transcript.iter().skip(start) {
-        lines.push(Line::from(Span::styled(line.clone(), Style::default().fg(NEON))));
+    let mut end = app.transcript.len();
+    while end > 0 {
+        if let Some(last) = app.transcript.get(end - 1) {
+            if last.is_empty() {
+                end = end.saturating_sub(1);
+                continue;
+            }
+        }
+        break;
     }
 
     let block = Block::default()
@@ -1598,6 +1605,40 @@ fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM))
         .style(Style::default().bg(BG));
+
+    let inner = block.inner(area);
+    let wrap_width = inner.width as usize;
+    let visible_lines = inner.height as usize;
+    let mut wrapped_lines: Vec<String> = Vec::new();
+
+    if wrap_width > 0 && visible_lines > 0 {
+        for line in app.transcript.iter().take(end) {
+            if line.is_empty() {
+                wrapped_lines.push(String::new());
+                continue;
+            }
+            let mut buf = String::new();
+            let mut count = 0usize;
+            for ch in line.chars() {
+                buf.push(ch);
+                count += 1;
+                if count >= wrap_width {
+                    wrapped_lines.push(buf);
+                    buf = String::new();
+                    count = 0;
+                }
+            }
+            if !buf.is_empty() {
+                wrapped_lines.push(buf);
+            }
+        }
+    }
+
+    let start = wrapped_lines.len().saturating_sub(visible_lines);
+    let mut lines = Vec::new();
+    for line in wrapped_lines.iter().skip(start) {
+        lines.push(Line::from(Span::styled(line.clone(), Style::default().fg(NEON))));
+    }
 
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)

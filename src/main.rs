@@ -24,6 +24,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Sparkline, Wrap};
 use ratatui::Terminal;
 use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tungstenite::client::{uri_mode, IntoClientRequest};
 use tungstenite::error::{Error as WsError, UrlError};
@@ -40,6 +41,7 @@ const DIM: Color = Color::Rgb(0, 120, 60);
 const ALERT: Color = Color::Rgb(255, 64, 64);
 const BG: Color = Color::Black;
 const PULSE_HISTORY_LEN: usize = 120;
+const PULSE_SAMPLE_MIN_MS: u64 = 50;
 
 #[derive(Parser, Debug)]
 #[command(name = "openclaw-visualizer", version, about = "OpenClaw gateway cyberpunk visualizer")]
@@ -83,7 +85,7 @@ enum GatewayMessage {
     Status(String),
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct DeviceIdentity {
     private_key: String,
     public_key: String,
@@ -93,6 +95,19 @@ struct DeviceIdentity {
 struct AgentState {
     status: String,
     last_at: Instant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Settings {
+    show_all_messages: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            show_all_messages: false,
+        }
+    }
 }
 
 struct App {
@@ -108,6 +123,7 @@ struct App {
     status: String,
     connection: String,
     pulse_history: VecDeque<u64>,
+    last_pulse_sample: Instant,
     last_latency_ms: Option<f64>,
     last_line: String,
     throughput_window: VecDeque<Instant>,
@@ -119,11 +135,14 @@ struct App {
     gateway_health_note: String,
     agent_statuses: HashMap<String, AgentState>,
     stream_cache: HashMap<String, String>,
+    show_all_messages: bool,
+    settings_path: PathBuf,
+    last_display_was_json_line: bool,
     paused: bool,
 }
 
 impl App {
-    fn new(connection: String) -> Self {
+    fn new(connection: String, settings_path: PathBuf, settings: Settings) -> Self {
         Self {
             start: Instant::now(),
             last_tick: Instant::now(),
@@ -137,6 +156,7 @@ impl App {
             status: "Awaiting telemetry...".to_string(),
             connection,
             pulse_history: VecDeque::from(vec![0; PULSE_HISTORY_LEN]),
+            last_pulse_sample: Instant::now(),
             last_latency_ms: None,
             last_line: String::new(),
             throughput_window: VecDeque::with_capacity(512),
@@ -148,6 +168,9 @@ impl App {
             gateway_health_note: String::new(),
             agent_statuses: HashMap::new(),
             stream_cache: HashMap::new(),
+            show_all_messages: settings.show_all_messages,
+            settings_path,
+            last_display_was_json_line: false,
             paused: false,
         }
     }
@@ -164,10 +187,18 @@ impl App {
         let mut latency_ms: Option<f64> = None;
 
         let mut display_text: Option<String> = None;
+        let mut display_is_stream = false;
+        let mut is_json_line = false;
 
         if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            is_json_line = true;
             self.ingest_system_events(&value);
-            display_text = extract_display_text(&value, &mut self.stream_cache);
+            if let Some(text) = extract_display_text(&value, &mut self.stream_cache) {
+                display_text = Some(text);
+                display_is_stream = true;
+            } else if self.show_all_messages {
+                display_text = Some(line.clone());
+            }
             if let Some(val) = value.get("type").and_then(|v| v.as_str()) {
                 event_type = val.to_string();
             } else if let Some(val) = value.get("event").and_then(|v| v.as_str()) {
@@ -199,6 +230,9 @@ impl App {
             if lower.contains("telemetry") {
                 event_type = "telemetry".to_string();
             }
+            if self.show_all_messages {
+                display_text = Some(line.clone());
+            }
         }
 
         if let Some(device) = device_id {
@@ -216,9 +250,17 @@ impl App {
         self.total += 1;
         self.last_event_at = Some(now);
         self.throughput_window.push_back(now);
+        self.record_pulse(now, false);
         if let Some(text) = display_text {
             if !text.is_empty() {
-                self.append_transcript(&text, now);
+                if self.show_all_messages && !display_is_stream {
+                    let gap_before = self.last_display_was_json_line && is_json_line;
+                    self.append_transcript_line(&text, now, gap_before);
+                    self.last_display_was_json_line = is_json_line;
+                } else {
+                    self.append_transcript(&text, now);
+                    self.last_display_was_json_line = false;
+                }
                 if let Some(last) = self.transcript.back() {
                     self.last_line = last.clone();
                 }
@@ -238,11 +280,7 @@ impl App {
             .map(|(_, count)| *count as u64)
             .sum();
         self.tokens_per_sec = (token_sum + 2) / 5;
-        let pulse = self.throughput_window.len() as u64;
-        self.pulse_history.push_back(pulse);
-        while self.pulse_history.len() > PULSE_HISTORY_LEN {
-            self.pulse_history.pop_front();
-        }
+        self.record_pulse(now, true);
         self.last_tick = now;
     }
 
@@ -271,6 +309,53 @@ impl App {
         while self.transcript.len() > 2000 {
             self.transcript.pop_front();
         }
+    }
+
+    fn append_transcript_line(&mut self, line: &str, at: Instant, gap_before: bool) {
+        let tokens = estimate_tokens(line);
+        if tokens > 0 {
+            self.token_window.push_back((at, tokens));
+            self.total_tokens = self.total_tokens.saturating_add(tokens as u64);
+        }
+        let want_gap = gap_before && !self.transcript.is_empty();
+        if self.transcript.is_empty() {
+            self.transcript.push_back(String::new());
+        }
+        if want_gap {
+            if let Some(last) = self.transcript.back() {
+                if !last.is_empty() {
+                    self.transcript.push_back(String::new());
+                }
+            }
+            if let Some(last) = self.transcript.back() {
+                if last.is_empty() {
+                    self.transcript.push_back(String::new());
+                }
+            }
+        } else if let Some(last) = self.transcript.back() {
+            if !last.is_empty() {
+                self.transcript.push_back(String::new());
+            }
+        }
+        if let Some(last) = self.transcript.back_mut() {
+            last.push_str(line);
+        }
+        self.transcript.push_back(String::new());
+        while self.transcript.len() > 2000 {
+            self.transcript.pop_front();
+        }
+    }
+
+    fn record_pulse(&mut self, now: Instant, force: bool) {
+        if !force && now.duration_since(self.last_pulse_sample) < Duration::from_millis(PULSE_SAMPLE_MIN_MS) {
+            return;
+        }
+        let pulse = self.throughput_window.len() as u64;
+        self.pulse_history.push_back(pulse);
+        while self.pulse_history.len() > PULSE_HISTORY_LEN {
+            self.pulse_history.pop_front();
+        }
+        self.last_pulse_sample = now;
     }
 
     fn ingest_system_events(&mut self, value: &Value) {
@@ -404,6 +489,9 @@ fn main() -> io::Result<()> {
         }
     };
 
+    let settings_path = settings_path();
+    let settings = load_settings(&settings_path);
+
     let connection = match &source {
         Source::WebSocket { url, .. } => url.clone(),
         Source::Stdin => "stdin".to_string(),
@@ -418,7 +506,7 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut app = App::new(connection);
+    let mut app = App::new(connection, settings_path, settings);
     let tick_rate = Duration::from_millis(70);
 
     loop {
@@ -435,7 +523,31 @@ fn main() -> io::Result<()> {
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('p') => app.paused = !app.paused,
-                        KeyCode::Char('r') => app = App::new(app.connection.clone()),
+                        KeyCode::Char('a') => {
+                            app.show_all_messages = !app.show_all_messages;
+                            let settings = Settings {
+                                show_all_messages: app.show_all_messages,
+                            };
+                            if let Err(err) = save_settings(&app.settings_path, &settings) {
+                                app.status = format!("Settings save failed: {err}");
+                            } else {
+                                app.status = if app.show_all_messages {
+                                    "Display: ALL messages".to_string()
+                                } else {
+                                    "Display: text only".to_string()
+                                };
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            let settings = Settings {
+                                show_all_messages: app.show_all_messages,
+                            };
+                            app = App::new(
+                                app.connection.clone(),
+                                app.settings_path.clone(),
+                                settings,
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -950,6 +1062,68 @@ fn fit_line(text: &str, max: usize) -> String {
     out
 }
 
+fn pulse_series(history: &VecDeque<u64>, width: usize) -> Vec<u64> {
+    if width == 0 {
+        return vec![0];
+    }
+    if history.is_empty() {
+        return vec![0; width];
+    }
+    if history.len() >= width {
+        history.iter().rev().take(width).rev().copied().collect()
+    } else {
+        let mut data = Vec::with_capacity(width);
+        let pad = width - history.len();
+        data.extend(std::iter::repeat(0).take(pad));
+        data.extend(history.iter().copied());
+        data
+    }
+}
+
+fn extract_gateway_domain(connection: &str) -> String {
+    if let Ok(url) = Url::parse(connection) {
+        if let Some(host) = url.host_str() {
+            return host.to_string();
+        }
+    }
+    if connection.starts_with("ws://") || connection.starts_with("wss://") {
+        return connection
+            .trim_start_matches("ws://")
+            .trim_start_matches("wss://")
+            .split('/')
+            .next()
+            .unwrap_or(connection)
+            .to_string();
+    }
+    connection.to_string()
+}
+
+fn settings_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".config")
+        })
+        .join("cyberpunk-openclaw-visualizer")
+        .join("settings.yaml")
+}
+
+fn load_settings(path: &Path) -> Settings {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Settings::default();
+    };
+    serde_yaml::from_str(&contents).unwrap_or_default()
+}
+
+fn save_settings(path: &Path, settings: &Settings) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let serialized = serde_yaml::to_string(settings).unwrap_or_default();
+    std::fs::write(path, serialized)
+}
+
 fn right_align(text: &str, width: usize) -> String {
     let len = text.chars().count();
     if len >= width {
@@ -1024,6 +1198,12 @@ fn extract_display_text(
         let state = payload.get("state").and_then(|v| v.as_str());
         if state != Some("final") {
             return None;
+        }
+        if let Some(run_id) = payload.get("runId").and_then(|v| v.as_str()) {
+            let key = format!("{run_id}:assistant");
+            if cache.contains_key(&key) {
+                return None;
+            }
         }
         let text = payload
             .get("message")
@@ -1107,10 +1287,13 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let uptime = format_duration(app.start.elapsed());
     let title_style = Style::default().fg(NEON_HOT).add_modifier(Modifier::BOLD);
     let status_style = Style::default().fg(NEON);
+    let gateway = extract_gateway_domain(&app.connection);
     let header = Line::from(vec![
         Span::styled("OPENCLAW GATEWAY VISUALIZER", title_style),
         Span::raw("  "),
-        Span::styled(format!("uptime {uptime}"), status_style),
+        Span::styled(gateway, status_style),
+        Span::raw("  "),
+        Span::styled(format!("uptime {uptime}"), Style::default().fg(DIM)),
     ]);
 
     let status_line = Line::from(vec![
@@ -1224,12 +1407,15 @@ fn render_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_pulse(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let data: Vec<u64> = app.pulse_history.iter().copied().collect();
     let block = Block::default()
         .title(Span::styled("PULSE", Style::default().fg(NEON_HOT)))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM))
         .style(Style::default().bg(BG));
+
+    let inner = block.inner(area);
+    let width = inner.width.max(1) as usize;
+    let data = pulse_series(&app.pulse_history, width);
 
     let sparkline = Sparkline::default()
         .block(block)
@@ -1420,11 +1606,18 @@ fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &App) {
+fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let all_style = if app.show_all_messages {
+        Style::default().fg(NEON).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
     let help = Line::from(vec![
         Span::styled("[q] Quit", Style::default().fg(DIM)),
         Span::raw("  "),
         Span::styled("[p] Pause", Style::default().fg(DIM)),
+        Span::raw("  "),
+        Span::styled("[a] All", all_style),
         Span::raw("  "),
         Span::styled("[r] Reset", Style::default().fg(DIM)),
     ]);

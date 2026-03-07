@@ -69,6 +69,14 @@ struct Args {
     /// Run in demo mode with synthetic traffic
     #[arg(long)]
     demo: bool,
+
+    /// Headless mode: print all gateway messages to stdout
+    #[arg(long)]
+    headless: bool,
+
+    /// Active window (minutes) for startup agent snapshot (0 = skip)
+    #[arg(long, default_value_t = 15)]
+    active_minutes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +201,7 @@ impl App {
         if let Ok(value) = serde_json::from_str::<Value>(&line) {
             is_json_line = true;
             self.ingest_system_events(&value);
+            self.ingest_gateway_responses(&value);
             if let Some(text) = extract_display_text(&value, &mut self.stream_cache) {
                 display_text = Some(text);
                 display_is_stream = true;
@@ -420,6 +429,39 @@ impl App {
             );
         }
     }
+
+    fn ingest_gateway_responses(&mut self, value: &Value) {
+        if value.get("type").and_then(|v| v.as_str()) != Some("res") {
+            return;
+        }
+        let payload = match value.get("payload") {
+            Some(p) => p,
+            None => return,
+        };
+
+        let mut running: Vec<(String, String)> = Vec::new();
+        collect_running_agents(payload, &mut running);
+        collect_active_sessions(payload, &mut running);
+        if running.is_empty() {
+            return;
+        }
+
+        self.agent_statuses.clear();
+        let now = Instant::now();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (id, status) in running {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            self.agent_statuses.insert(
+                id,
+                AgentState {
+                    status,
+                    last_at: now,
+                },
+            );
+        }
+    }
 }
 
 enum Source {
@@ -428,6 +470,7 @@ enum Source {
         token: Option<String>,
         insecure_tls: bool,
         debug: bool,
+        active_minutes: u64,
     },
     Stdin,
     Demo,
@@ -489,6 +532,7 @@ fn main() -> io::Result<()> {
             token: token.clone(),
             insecure_tls,
             debug: args.debug,
+            active_minutes: args.active_minutes,
         }
     };
 
@@ -503,6 +547,10 @@ fn main() -> io::Result<()> {
 
     let (tx, rx) = mpsc::channel::<GatewayMessage>();
     spawn_reader(source, tx);
+
+    if args.headless {
+        return run_headless(rx);
+    }
 
     let _guard = TerminalGuard::init()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -568,6 +616,36 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+fn run_headless(rx: mpsc::Receiver<GatewayMessage>) -> io::Result<()> {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            GatewayMessage::Line(line) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    let msg_type = value.get("type").and_then(|v| v.as_str());
+                    let event = value.get("event").and_then(|v| v.as_str());
+                    let label = match (msg_type, event) {
+                        (Some(t), Some(e)) => format!("{t}/{e}"),
+                        (Some(t), None) => t.to_string(),
+                        (None, Some(e)) => e.to_string(),
+                        (None, None) => String::new(),
+                    };
+                    if label.is_empty() {
+                        println!("{line}");
+                    } else {
+                        println!("[{label}] {line}");
+                    }
+                } else {
+                    println!("{line}");
+                }
+            }
+            GatewayMessage::Status(status) => {
+                eprintln!("[status] {status}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn spawn_reader(source: Source, tx: mpsc::Sender<GatewayMessage>) {
     thread::spawn(move || match source {
         Source::WebSocket {
@@ -575,7 +653,8 @@ fn spawn_reader(source: Source, tx: mpsc::Sender<GatewayMessage>) {
             token,
             insecure_tls,
             debug,
-        } => read_websocket(url, token, insecure_tls, debug, tx),
+            active_minutes,
+        } => read_websocket(url, token, insecure_tls, debug, active_minutes, tx),
         Source::Stdin => read_stdin(tx),
         Source::Demo => read_demo(tx),
     });
@@ -586,6 +665,7 @@ fn read_websocket(
     token: Option<String>,
     insecure_tls: bool,
     debug: bool,
+    active_minutes: u64,
     tx: mpsc::Sender<GatewayMessage>,
 ) {
     let mut backoff = Duration::from_secs(1);
@@ -627,6 +707,8 @@ fn read_websocket(
                 let (device_id, signing_key) = load_or_create_device_identity();
                 let mut connect_id: Option<String> = None;
                 let mut connect_sent = false;
+                let mut status_sent = false;
+                let mut sessions_sent = false;
                 loop {
                     match socket.read() {
                         Ok(Message::Text(text)) => {
@@ -715,6 +797,58 @@ fn read_websocket(
                                                     debug,
                                                     "Gateway connect accepted".to_string(),
                                                 );
+                                                if !status_sent {
+                                                    let request_id = new_request_id();
+                                                    let message = build_status_request(&request_id);
+                                                    match socket.send(Message::Text(message)) {
+                                                        Ok(_) => {
+                                                            status_sent = true;
+                                                            send_status(
+                                                                &tx,
+                                                                debug,
+                                                                "Requested running agent snapshot".to_string(),
+                                                            );
+                                                        }
+                                                        Err(err) => {
+                                                            send_status(
+                                                                &tx,
+                                                                debug,
+                                                                format!(
+                                                                    "Agent snapshot request failed: {err}"
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                if !sessions_sent && active_minutes > 0 {
+                                                    let request_id = new_request_id();
+                                                    let message = build_sessions_list_request(
+                                                        &request_id,
+                                                        active_minutes,
+                                                    );
+                                                    match socket.send(Message::Text(message)) {
+                                                        Ok(_) => {
+                                                            sessions_sent = true;
+                                                            send_status(
+                                                                &tx,
+                                                                debug,
+                                                                format!(
+                                                                    "Requested active sessions (last {}m)",
+                                                                    active_minutes
+                                                                ),
+                                                            );
+                                                        }
+                                                        Err(err) => {
+                                                            send_status(
+                                                                &tx,
+                                                                debug,
+                                                                format!(
+                                                                    "Active sessions request failed: {err}"
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                                 if let Some(device_token) = value
                                                     .get("payload")
                                                     .and_then(|p| p.get("auth"))
@@ -953,6 +1087,28 @@ fn build_connect_request(
     .to_string()
 }
 
+fn build_status_request(request_id: &str) -> String {
+    json!({
+        "type": "req",
+        "id": request_id,
+        "method": "status",
+        "params": {}
+    })
+    .to_string()
+}
+
+fn build_sessions_list_request(request_id: &str, active_minutes: u64) -> String {
+    json!({
+        "type": "req",
+        "id": request_id,
+        "method": "sessions.list",
+        "params": {
+            "activeMinutes": active_minutes
+        }
+    })
+    .to_string()
+}
+
 fn lookup_env(dotenv_map: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
     for key in keys {
         if let Ok(value) = std::env::var(key) {
@@ -995,6 +1151,211 @@ fn status_style_for(status: &str) -> Style {
         "ENDED" => Style::default().fg(DIM),
         _ => Style::default().fg(NEON),
     }
+}
+
+fn normalize_agent_status(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "start" | "started" | "running" | "resume" | "resumed" | "in_flight" | "in-flight"
+        | "streaming" | "active" => "RUNNING".to_string(),
+        "end" | "ended" | "stop" | "stopped" | "done" | "completed" | "ok" => "ENDED".to_string(),
+        "error" | "failed" | "failure" | "crashed" => "ERROR".to_string(),
+        other => other.to_ascii_uppercase(),
+    }
+}
+
+fn is_active_status(status: &str) -> bool {
+    matches!(status, "RUNNING" | "IN_FLIGHT" | "STREAMING" | "ACTIVE")
+}
+
+fn collect_running_agents(payload: &Value, out: &mut Vec<(String, String)>) {
+    let implicit_running_keys = [
+        "running",
+        "runningRuns",
+        "running_runs",
+        "activeRuns",
+        "active_runs",
+        "agentRuns",
+        "agent_runs",
+        "inFlight",
+        "in_flight",
+    ];
+
+    for key in implicit_running_keys {
+        if let Some(list) = payload.get(key).and_then(|v| v.as_array()) {
+            collect_running_from_array(list, out, false);
+        }
+    }
+
+    if let Some(list) = payload.get("runs").and_then(|v| v.as_array()) {
+        collect_running_from_array(list, out, true);
+    }
+
+    if let Some(agents) = payload.get("agents") {
+        if let Some(list) = agents.get("running").and_then(|v| v.as_array()) {
+            collect_running_from_array(list, out, false);
+        }
+        if let Some(list) = agents.get("active").and_then(|v| v.as_array()) {
+            collect_running_from_array(list, out, false);
+        }
+    }
+
+    if let Some(sessions) = payload.get("sessions").and_then(|v| v.as_array()) {
+        for session in sessions {
+            if let Some(entry) = extract_running_from_session(session) {
+                out.push(entry);
+            }
+        }
+    }
+}
+
+fn collect_running_from_array(entries: &[Value], out: &mut Vec<(String, String)>, require_status: bool) {
+    for entry in entries {
+        if let Some(value) = extract_running_from_value(entry, require_status) {
+            out.push(value);
+        }
+    }
+}
+
+fn collect_active_sessions(payload: &Value, out: &mut Vec<(String, String)>) {
+    if let Some(list) = payload.as_array() {
+        collect_active_sessions_from_array(list, out);
+        return;
+    }
+    if let Some(list) = payload.get("rows").and_then(|v| v.as_array()) {
+        collect_active_sessions_from_array(list, out);
+        return;
+    }
+    if let Some(list) = payload.get("sessions").and_then(|v| v.as_array()) {
+        collect_active_sessions_from_array(list, out);
+        return;
+    }
+    if let Some(list) = payload.get("items").and_then(|v| v.as_array()) {
+        collect_active_sessions_from_array(list, out);
+    }
+}
+
+fn collect_active_sessions_from_array(entries: &[Value], out: &mut Vec<(String, String)>) {
+    for entry in entries {
+        if let Some(value) = extract_active_session(entry) {
+            out.push(value);
+        }
+    }
+}
+
+fn extract_active_session(entry: &Value) -> Option<(String, String)> {
+    if let Some(id) = entry.as_str() {
+        return Some((id.to_string(), "RUNNING".to_string()));
+    }
+    let obj = entry.as_object()?;
+
+    if obj.get("active").and_then(|v| v.as_bool()) == Some(false) {
+        return None;
+    }
+
+    let id = obj
+        .get("key")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("sessionKey").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("sessionId").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("id").and_then(|v| v.as_str()))?;
+
+    let raw_status = obj
+        .get("status")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("phase").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("state").and_then(|v| v.as_str()));
+    let status = raw_status
+        .map(normalize_agent_status)
+        .unwrap_or_else(|| "RUNNING".to_string());
+
+    Some((id.to_string(), status))
+}
+
+fn extract_running_from_value(entry: &Value, require_status: bool) -> Option<(String, String)> {
+    if let Some(id) = entry.as_str() {
+        if require_status {
+            return None;
+        }
+        return Some((id.to_string(), "RUNNING".to_string()));
+    }
+    let obj = entry.as_object()?;
+
+    let active_flag = obj
+        .get("active")
+        .and_then(|v| v.as_bool())
+        .or_else(|| obj.get("running").and_then(|v| v.as_bool()));
+    if matches!(active_flag, Some(false)) {
+        return None;
+    }
+
+    let raw_status = obj
+        .get("status")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("phase").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("state").and_then(|v| v.as_str()));
+    let status = raw_status.map(normalize_agent_status);
+    let active_by_status = status
+        .as_deref()
+        .map(is_active_status)
+        .unwrap_or(false);
+    if require_status && !active_by_status && !matches!(active_flag, Some(true)) {
+        return None;
+    }
+    if let Some(ref normalized) = status {
+        if !is_active_status(normalized) {
+            return None;
+        }
+    }
+
+    let id = obj
+        .get("sessionKey")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("runId").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("id").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("agent").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("agentId").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("key").and_then(|v| v.as_str()))?;
+
+    Some((
+        id.to_string(),
+        status.unwrap_or_else(|| "RUNNING".to_string()),
+    ))
+}
+
+fn extract_running_from_session(session: &Value) -> Option<(String, String)> {
+    let obj = session.as_object()?;
+    let active_flag = obj
+        .get("active")
+        .and_then(|v| v.as_bool())
+        .or_else(|| obj.get("running").and_then(|v| v.as_bool()));
+    if matches!(active_flag, Some(false)) {
+        return None;
+    }
+
+    let has_run = obj.get("activeRunId").or_else(|| obj.get("runId")).is_some();
+    if !has_run {
+        return None;
+    }
+
+    let raw_status = obj
+        .get("runStatus")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("status").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("phase").and_then(|v| v.as_str()));
+    let status = raw_status
+        .map(normalize_agent_status)
+        .unwrap_or_else(|| "RUNNING".to_string());
+    if !is_active_status(&status) {
+        return None;
+    }
+
+    let id = obj
+        .get("sessionKey")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("activeRunId").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("runId").and_then(|v| v.as_str()))?;
+
+    Some((id.to_string(), status))
 }
 
 fn is_root_agent(id: &str) -> bool {

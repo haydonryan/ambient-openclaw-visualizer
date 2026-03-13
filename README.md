@@ -50,7 +50,7 @@ Environment variables are read from `.env` and the process environment. CLI flag
 - `Ctrl-P` Pause
 - `Ctrl-A` Toggle all messages
 - `Ctrl-H` Toggle help
-- `Ctrl-Q` Quit
+- `Ctrl-D` Quit
 
 ## Build
 

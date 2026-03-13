@@ -636,7 +636,7 @@ fn main() -> io::Result<()> {
                         continue;
                     }
                     match key.code {
-                        KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => break,
+                        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => break,
                         KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
                             app.paused = !app.paused
                         }
@@ -2263,7 +2263,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw("  "),
         Span::styled("[Ctrl-H] Help", Style::default().fg(DIM)),
         Span::raw("  "),
-        Span::styled("[Ctrl-Q] Quit", Style::default().fg(DIM)),
+        Span::styled("[Ctrl-D] Quit", Style::default().fg(DIM)),
     ]);
 
     let prompt_style = Style::default().fg(NEON_HOT).add_modifier(Modifier::BOLD);
@@ -2320,7 +2320,7 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         Line::from(Span::styled("[Enter] Send message", Style::default().fg(NEON))),
         Line::from(Span::styled("[Esc] Clear input", Style::default().fg(NEON))),
         Line::from(Span::styled("[Ctrl-U] Clear input", Style::default().fg(NEON))),
-        Line::from(Span::styled("[Ctrl-Q] Quit", Style::default().fg(NEON))),
+        Line::from(Span::styled("[Ctrl-D] Quit", Style::default().fg(NEON))),
         Line::from(Span::styled("[Ctrl-P] Pause/Resume", Style::default().fg(NEON))),
         Line::from(Span::styled(
             "[Ctrl-A] Toggle ALL messages",

@@ -111,6 +111,27 @@ struct AgentState {
     last_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TranscriptTone {
+    Default,
+    User,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptEntry {
+    text: String,
+    tone: TranscriptTone,
+}
+
+impl Default for TranscriptEntry {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            tone: TranscriptTone::Default,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Settings {
     show_all_messages: bool,
@@ -133,7 +154,7 @@ struct App {
     unique_devices: HashSet<String>,
     types: HashMap<String, u64>,
     recent: VecDeque<GatewayEvent>,
-    transcript: VecDeque<String>,
+    transcript: VecDeque<TranscriptEntry>,
     status: String,
     connection: String,
     pulse_history: VecDeque<u64>,
@@ -284,7 +305,7 @@ impl App {
                     self.last_display_was_json_line = false;
                 }
                 if let Some(last) = self.transcript.back() {
-                    self.last_line = last.clone();
+                    self.last_line = last.text.clone();
                 }
             }
         }
@@ -314,19 +335,19 @@ impl App {
         }
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.transcript.is_empty() {
-            self.transcript.push_back(String::new());
+            self.transcript.push_back(TranscriptEntry::default());
         }
         let mut remaining = normalized.as_str();
         while let Some(pos) = remaining.find('\n') {
             let (head, tail) = remaining.split_at(pos);
             if let Some(last) = self.transcript.back_mut() {
-                last.push_str(head);
+                last.text.push_str(head);
             }
-            self.transcript.push_back(String::new());
+            self.transcript.push_back(TranscriptEntry::default());
             remaining = &tail[1..];
         }
         if let Some(last) = self.transcript.back_mut() {
-            last.push_str(remaining);
+            last.text.push_str(remaining);
         }
         while self.transcript.len() > 2000 {
             self.transcript.pop_front();
@@ -341,31 +362,58 @@ impl App {
         }
         let want_gap = gap_before && !self.transcript.is_empty();
         if self.transcript.is_empty() {
-            self.transcript.push_back(String::new());
+            self.transcript.push_back(TranscriptEntry::default());
         }
         if want_gap {
             if let Some(last) = self.transcript.back() {
-                if !last.is_empty() {
-                    self.transcript.push_back(String::new());
+                if !last.text.is_empty() {
+                    self.transcript.push_back(TranscriptEntry::default());
                 }
             }
             if let Some(last) = self.transcript.back() {
-                if last.is_empty() {
-                    self.transcript.push_back(String::new());
+                if last.text.is_empty() {
+                    self.transcript.push_back(TranscriptEntry::default());
                 }
             }
         } else if let Some(last) = self.transcript.back() {
-            if !last.is_empty() {
-                self.transcript.push_back(String::new());
+            if !last.text.is_empty() {
+                self.transcript.push_back(TranscriptEntry::default());
             }
         }
         if let Some(last) = self.transcript.back_mut() {
-            last.push_str(line);
+            last.text.push_str(line);
         }
-        self.transcript.push_back(String::new());
+        self.transcript.push_back(TranscriptEntry::default());
         while self.transcript.len() > 2000 {
             self.transcript.pop_front();
         }
+    }
+
+    fn append_local_user_message(&mut self, message: &str, at: Instant) {
+        if self.transcript.is_empty() {
+            self.transcript.push_back(TranscriptEntry::default());
+        }
+        if let Some(last) = self.transcript.back() {
+            if !last.text.is_empty() {
+                self.transcript.push_back(TranscriptEntry::default());
+            }
+        }
+        let tokens = estimate_tokens(message);
+        if tokens > 0 {
+            self.token_window.push_back((at, tokens));
+            self.total_tokens = self.total_tokens.saturating_add(tokens as u64);
+        }
+        self.transcript.push_back(TranscriptEntry {
+            text: message.to_string(),
+            tone: TranscriptTone::User,
+        });
+        self.transcript.push_back(TranscriptEntry::default());
+        self.transcript.push_back(TranscriptEntry::default());
+        while self.transcript.len() > 2000 {
+            self.transcript.pop_front();
+        }
+        self.last_display_was_json_line = false;
+        self.last_line = message.to_string();
     }
 
     fn record_pulse(&mut self, now: Instant, force: bool) {
@@ -615,6 +663,7 @@ fn main() -> io::Result<()> {
                                 app.status = "Message input only works with --gateway".to_string();
                                 continue;
                             }
+                            let now = Instant::now();
                             let message = app.input.trim().to_string();
                             if message.is_empty() {
                                 continue;
@@ -624,6 +673,7 @@ fn main() -> io::Result<()> {
                                 message: message.clone(),
                             }) {
                                 Ok(_) => {
+                                    app.append_local_user_message(&message, now);
                                     app.status = "Queued message for main agent".to_string();
                                     app.input.clear();
                                 }
@@ -2126,7 +2176,7 @@ fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let mut end = app.transcript.len();
     while end > 0 {
         if let Some(last) = app.transcript.get(end - 1) {
-            if last.is_empty() {
+            if last.text.is_empty() {
                 end = end.saturating_sub(1);
                 continue;
             }
@@ -2143,27 +2193,36 @@ fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     let wrap_width = inner.width as usize;
     let visible_lines = inner.height as usize;
-    let mut wrapped_lines: Vec<String> = Vec::new();
+    let mut wrapped_lines: Vec<TranscriptEntry> = Vec::new();
 
     if wrap_width > 0 && visible_lines > 0 {
         for line in app.transcript.iter().take(end) {
-            if line.is_empty() {
-                wrapped_lines.push(String::new());
+            if line.text.is_empty() {
+                wrapped_lines.push(TranscriptEntry {
+                    text: String::new(),
+                    tone: line.tone,
+                });
                 continue;
             }
             let mut buf = String::new();
             let mut count = 0usize;
-            for ch in line.chars() {
+            for ch in line.text.chars() {
                 buf.push(ch);
                 count += 1;
                 if count >= wrap_width {
-                    wrapped_lines.push(buf);
+                    wrapped_lines.push(TranscriptEntry {
+                        text: buf,
+                        tone: line.tone,
+                    });
                     buf = String::new();
                     count = 0;
                 }
             }
             if !buf.is_empty() {
-                wrapped_lines.push(buf);
+                wrapped_lines.push(TranscriptEntry {
+                    text: buf,
+                    tone: line.tone,
+                });
             }
         }
     }
@@ -2171,7 +2230,11 @@ fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let start = wrapped_lines.len().saturating_sub(visible_lines);
     let mut lines = Vec::new();
     for line in wrapped_lines.iter().skip(start) {
-        lines.push(Line::from(Span::styled(line.clone(), Style::default().fg(NEON))));
+        let style = match line.tone {
+            TranscriptTone::Default => Style::default().fg(NEON),
+            TranscriptTone::User => Style::default().fg(NEON_HOT),
+        };
+        lines.push(Line::from(Span::styled(line.text.clone(), style)));
     }
 
     let paragraph = Paragraph::new(Text::from(lines))

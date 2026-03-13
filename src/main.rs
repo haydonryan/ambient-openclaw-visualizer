@@ -94,6 +94,11 @@ enum GatewayMessage {
     Status(String),
 }
 
+#[derive(Debug, Clone)]
+enum GatewayCommand {
+    SendChat { session_key: String, message: String },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct DeviceIdentity {
     private_key: String,
@@ -149,6 +154,7 @@ struct App {
     last_display_was_json_line: bool,
     paused: bool,
     show_help: bool,
+    input: String,
 }
 
 impl App {
@@ -183,6 +189,7 @@ impl App {
             last_display_was_json_line: false,
             paused: false,
             show_help: false,
+            input: String::new(),
         }
     }
 
@@ -549,7 +556,9 @@ fn main() -> io::Result<()> {
     };
 
     let (tx, rx) = mpsc::channel::<GatewayMessage>();
-    spawn_reader(source, tx);
+    let (command_tx, command_rx) = mpsc::channel::<GatewayCommand>();
+    let allow_input = matches!(source, Source::WebSocket { .. });
+    spawn_reader(source, tx, command_rx);
 
     if args.headless {
         return run_headless(rx);
@@ -578,10 +587,12 @@ fn main() -> io::Result<()> {
                         app.show_help = false;
                         continue;
                     }
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Char('q'), _) => break,
-                        (KeyCode::Char('p'), _) => app.paused = !app.paused,
-                        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                    match key.code {
+                        KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => break,
+                        KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                            app.paused = !app.paused
+                        }
+                        KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
                             app.show_all_messages = !app.show_all_messages;
                             let settings = Settings {
                                 show_all_messages: app.show_all_messages,
@@ -596,8 +607,47 @@ fn main() -> io::Result<()> {
                                 };
                             }
                         }
-                        (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+                        KeyCode::Char('h') if key.modifiers == KeyModifiers::CONTROL => {
                             app.show_help = !app.show_help;
+                        }
+                        KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                            if !allow_input {
+                                app.status = "Message input only works with --gateway".to_string();
+                                continue;
+                            }
+                            let message = app.input.trim().to_string();
+                            if message.is_empty() {
+                                continue;
+                            }
+                            match command_tx.send(GatewayCommand::SendChat {
+                                session_key: "main".to_string(),
+                                message: message.clone(),
+                            }) {
+                                Ok(_) => {
+                                    app.status = "Queued message for main agent".to_string();
+                                    app.input.clear();
+                                }
+                                Err(err) => {
+                                    app.status = format!("Send queue failed: {err}");
+                                }
+                            }
+                        }
+                        KeyCode::Backspace if key.modifiers == KeyModifiers::NONE => {
+                            app.input.pop();
+                        }
+                        KeyCode::Esc if key.modifiers == KeyModifiers::NONE => {
+                            app.input.clear();
+                        }
+                        KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                            app.input.clear();
+                        }
+                        KeyCode::Char(ch)
+                            if key.modifiers.is_empty()
+                                || key.modifiers == KeyModifiers::SHIFT =>
+                        {
+                            if allow_input {
+                                app.input.push(ch);
+                            }
                         }
                         _ => {}
                     }
@@ -646,7 +696,11 @@ fn run_headless(rx: mpsc::Receiver<GatewayMessage>) -> io::Result<()> {
     Ok(())
 }
 
-fn spawn_reader(source: Source, tx: mpsc::Sender<GatewayMessage>) {
+fn spawn_reader(
+    source: Source,
+    tx: mpsc::Sender<GatewayMessage>,
+    command_rx: mpsc::Receiver<GatewayCommand>,
+) {
     thread::spawn(move || match source {
         Source::WebSocket {
             url,
@@ -654,7 +708,15 @@ fn spawn_reader(source: Source, tx: mpsc::Sender<GatewayMessage>) {
             insecure_tls,
             debug,
             active_minutes,
-        } => read_websocket(url, token, insecure_tls, debug, active_minutes, tx),
+        } => read_websocket(
+            url,
+            token,
+            insecure_tls,
+            debug,
+            active_minutes,
+            tx,
+            command_rx,
+        ),
         Source::Stdin => read_stdin(tx),
         Source::Demo => read_demo(tx),
     });
@@ -667,6 +729,7 @@ fn read_websocket(
     debug: bool,
     active_minutes: u64,
     tx: mpsc::Sender<GatewayMessage>,
+    command_rx: mpsc::Receiver<GatewayCommand>,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -702,6 +765,7 @@ fn read_websocket(
         send_status(&tx, debug, format!("Connecting to {url}..."));
         match connect_gateway(request, insecure_tls) {
             Ok((mut socket, _)) => {
+                configure_socket_timeouts(socket.get_mut());
                 backoff = Duration::from_secs(1);
                 send_status(&tx, debug, format!("Connected to {url}"));
                 let (device_id, signing_key) = load_or_create_device_identity();
@@ -710,6 +774,9 @@ fn read_websocket(
                 let mut status_sent = false;
                 let mut sessions_sent = false;
                 loop {
+                    while let Ok(command) = command_rx.try_recv() {
+                        handle_gateway_command(&mut socket, &tx, debug, command);
+                    }
                     match socket.read() {
                         Ok(Message::Text(text)) => {
                             if let Ok(value) = serde_json::from_str::<Value>(&text) {
@@ -900,6 +967,9 @@ fn read_websocket(
                             break;
                         }
                         Err(err) => {
+                            if is_timeout_error(&err) {
+                                continue;
+                            }
                             send_status(&tx, debug, format!("Gateway error: {err}"));
                             break;
                         }
@@ -927,6 +997,54 @@ fn send_status(tx: &mpsc::Sender<GatewayMessage>, debug: bool, message: String) 
         eprintln!("[openclaw] {message}");
     }
     let _ = tx.send(GatewayMessage::Status(message));
+}
+
+fn handle_gateway_command(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    tx: &mpsc::Sender<GatewayMessage>,
+    debug: bool,
+    command: GatewayCommand,
+) {
+    match command {
+        GatewayCommand::SendChat {
+            session_key,
+            message,
+        } => {
+            let request_id = new_request_id();
+            let payload = build_chat_send_request(&request_id, &session_key, &message);
+            match socket.send(Message::Text(payload)) {
+                Ok(_) => {
+                    send_status(tx, debug, format!("Sent chat.send to {session_key}"));
+                }
+                Err(err) => {
+                    send_status(tx, debug, format!("chat.send failed: {err}"));
+                }
+            }
+        }
+    }
+}
+
+fn configure_socket_timeouts(stream: &mut MaybeTlsStream<TcpStream>) {
+    let timeout = Some(Duration::from_millis(100));
+    match stream {
+        MaybeTlsStream::Plain(inner) => {
+            let _ = inner.set_read_timeout(timeout);
+        }
+        MaybeTlsStream::NativeTls(inner) => {
+            let _ = inner.get_mut().set_read_timeout(timeout);
+        }
+        _ => {}
+    }
+}
+
+fn is_timeout_error(err: &WsError) -> bool {
+    match err {
+        WsError::Io(io_err) => matches!(
+            io_err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ),
+        _ => false,
+    }
 }
 
 fn connect_gateway<Req: IntoClientRequest>(
@@ -1104,6 +1222,20 @@ fn build_sessions_list_request(request_id: &str, active_minutes: u64) -> String 
         "method": "sessions.list",
         "params": {
             "activeMinutes": active_minutes
+        }
+    })
+    .to_string()
+}
+
+fn build_chat_send_request(request_id: &str, session_key: &str, message: &str) -> String {
+    json!({
+        "type": "req",
+        "id": request_id,
+        "method": "chat.send",
+        "params": {
+            "sessionKey": session_key,
+            "message": message,
+            "idempotencyKey": request_id
         }
     })
     .to_string()
@@ -2056,27 +2188,53 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Style::default().fg(DIM)
     };
     let help = Line::from(vec![
-        Span::styled("[q] Quit", Style::default().fg(DIM)),
+        Span::styled("[Enter] Send", Style::default().fg(DIM)),
         Span::raw("  "),
-        Span::styled("[p] Pause", Style::default().fg(DIM)),
+        Span::styled("[Esc] Clear", Style::default().fg(DIM)),
+        Span::raw("  "),
+        Span::styled("[Ctrl-U] Clear", Style::default().fg(DIM)),
+        Span::raw("  "),
+        Span::styled("[Ctrl-P] Pause", Style::default().fg(DIM)),
         Span::raw("  "),
         Span::styled("[Ctrl-A] All", all_style),
         Span::raw("  "),
         Span::styled("[Ctrl-H] Help", Style::default().fg(DIM)),
+        Span::raw("  "),
+        Span::styled("[Ctrl-Q] Quit", Style::default().fg(DIM)),
+    ]);
+
+    let prompt_style = Style::default().fg(NEON_HOT).add_modifier(Modifier::BOLD);
+    let input_text = if app.input.is_empty() {
+        Span::styled("Type a message for the main agent...", Style::default().fg(DIM))
+    } else {
+        Span::styled(app.input.clone(), Style::default().fg(NEON))
+    };
+    let input_line = Line::from(vec![
+        Span::styled("> ", prompt_style),
+        input_text,
     ]);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM))
         .style(Style::default().bg(BG));
+    let inner = block.inner(area);
 
-    let text = Text::from(vec![help]);
+    let text = Text::from(vec![input_line, help]);
     let paragraph = Paragraph::new(text)
         .block(block)
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true });
 
     frame.render_widget(paragraph, area);
+    let cursor_x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(app.input.chars().count() as u16);
+    let cursor_y = inner.y;
+    if cursor_x < area.right().saturating_sub(1) {
+        frame.set_cursor(cursor_x, cursor_y);
+    }
 }
 
 fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -2095,8 +2253,12 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
             Style::default().fg(NEON).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled("[q] Quit", Style::default().fg(NEON))),
-        Line::from(Span::styled("[p] Pause/Resume", Style::default().fg(NEON))),
+        Line::from(Span::styled("Type to compose a message to session `main`", Style::default().fg(NEON))),
+        Line::from(Span::styled("[Enter] Send message", Style::default().fg(NEON))),
+        Line::from(Span::styled("[Esc] Clear input", Style::default().fg(NEON))),
+        Line::from(Span::styled("[Ctrl-U] Clear input", Style::default().fg(NEON))),
+        Line::from(Span::styled("[Ctrl-Q] Quit", Style::default().fg(NEON))),
+        Line::from(Span::styled("[Ctrl-P] Pause/Resume", Style::default().fg(NEON))),
         Line::from(Span::styled(
             "[Ctrl-A] Toggle ALL messages",
             Style::default().fg(NEON),

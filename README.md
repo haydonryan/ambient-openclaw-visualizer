@@ -43,10 +43,14 @@ Environment variables are read from `.env` and the process environment. CLI flag
 
 ## Controls
 
-- `q` Quit
-- `p` Pause
-- `a` Toggle all messages
-- `r` Reset session stats
+- Type in the footer to compose a message for the `main` agent session
+- `Enter` Send the current message
+- `Esc` Clear the current message
+- `Ctrl-U` Clear the current message
+- `Ctrl-P` Pause
+- `Ctrl-A` Toggle all messages
+- `Ctrl-H` Toggle help
+- `Ctrl-Q` Quit
 
 ## Build
 

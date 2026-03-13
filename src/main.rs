@@ -11,7 +11,7 @@ use base64::{
     Engine,
 };
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use ed25519_dalek::{Signer, SigningKey};
@@ -21,7 +21,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Sparkline, Wrap};
+use ratatui::symbols;
+use ratatui::widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, Paragraph, Wrap};
 use ratatui::Terminal;
 use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
@@ -41,7 +42,7 @@ const DIM: Color = Color::Rgb(0, 120, 60);
 const ALERT: Color = Color::Rgb(255, 64, 64);
 const BG: Color = Color::Black;
 const PULSE_HISTORY_LEN: usize = 120;
-const PULSE_SAMPLE_MIN_MS: u64 = 50;
+const PULSE_SAMPLE_MIN_MS: u64 = 700;
 
 #[derive(Parser, Debug)]
 #[command(name = "openclaw-visualizer", version, about = "OpenClaw gateway cyberpunk visualizer")]
@@ -147,6 +148,7 @@ struct App {
     settings_path: PathBuf,
     last_display_was_json_line: bool,
     paused: bool,
+    show_help: bool,
 }
 
 impl App {
@@ -180,6 +182,7 @@ impl App {
             settings_path,
             last_display_was_json_line: false,
             paused: false,
+            show_help: false,
         }
     }
 
@@ -292,7 +295,7 @@ impl App {
             .map(|(_, count)| *count as u64)
             .sum();
         self.tokens_per_sec = (token_sum + 2) / 5;
-        self.record_pulse(now, true);
+        self.record_pulse(now, false);
         self.last_tick = now;
     }
 
@@ -571,10 +574,14 @@ fn main() -> io::Result<()> {
         if event::poll(Duration::from_millis(0))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Char('p') => app.paused = !app.paused,
-                        KeyCode::Char('a') => {
+                    if app.show_help {
+                        app.show_help = false;
+                        continue;
+                    }
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('q'), _) => break,
+                        (KeyCode::Char('p'), _) => app.paused = !app.paused,
+                        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
                             app.show_all_messages = !app.show_all_messages;
                             let settings = Settings {
                                 show_all_messages: app.show_all_messages,
@@ -589,15 +596,8 @@ fn main() -> io::Result<()> {
                                 };
                             }
                         }
-                        KeyCode::Char('r') => {
-                            let settings = Settings {
-                                show_all_messages: app.show_all_messages,
-                            };
-                            app = App::new(
-                                app.connection.clone(),
-                                app.settings_path.clone(),
-                                settings,
-                            );
+                        (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+                            app.show_help = !app.show_help;
                         }
                         _ => {}
                     }
@@ -1645,6 +1645,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     render_stats(frame, chunks[1], app);
     render_log(frame, chunks[2], app);
     render_footer(frame, chunks[3], app);
+    if app.show_help {
+        render_help(frame, size);
+    }
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -1652,12 +1655,38 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let title_style = Style::default().fg(NEON_HOT).add_modifier(Modifier::BOLD);
     let status_style = Style::default().fg(NEON);
     let gateway = extract_gateway_domain(&app.connection);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(DIM))
+        .style(Style::default().bg(BG));
+    let inner_width = block.inner(area).width as usize;
+    let title_text = "OPENCLAW GATEWAY INTERFACE";
+    let uptime_text = format!("uptime {uptime}");
+    let all_style = if app.show_all_messages {
+        Style::default().fg(NEON).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let help_text = "Ctrl-H Help";
+    let left_len = title_text.chars().count()
+        + 2
+        + gateway.chars().count()
+        + 2
+        + uptime_text.chars().count();
+    let right_len = 3 + 2 + help_text.chars().count();
+    let pad = inner_width
+        .saturating_sub(left_len + right_len)
+        .max(1);
     let header = Line::from(vec![
-        Span::styled("OPENCLAW GATEWAY VISUALIZER", title_style),
+        Span::styled(title_text, title_style),
         Span::raw("  "),
         Span::styled(gateway, status_style),
         Span::raw("  "),
-        Span::styled(format!("uptime {uptime}"), Style::default().fg(DIM)),
+        Span::styled(uptime_text, Style::default().fg(DIM)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled("ALL", all_style),
+        Span::raw("  "),
+        Span::styled(help_text, Style::default().fg(DIM)),
     ]);
 
     let status_line = Line::from(vec![
@@ -1667,11 +1696,6 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::styled("CONN: ", Style::default().fg(DIM)),
         Span::styled(app.connection.clone(), Style::default().fg(NEON)),
     ]);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM))
-        .style(Style::default().bg(BG));
 
     let text = Text::from(vec![header, status_line]);
     let paragraph = Paragraph::new(text)
@@ -1780,13 +1804,30 @@ fn render_pulse(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     let width = inner.width.max(1) as usize;
     let data = pulse_series(&app.pulse_history, width);
-
-    let sparkline = Sparkline::default()
+    let points: Vec<(f64, f64)> = data
+        .iter()
+        .enumerate()
+        .map(|(idx, &val)| (idx as f64, val as f64))
+        .collect();
+    let max_val = data.iter().copied().max().unwrap_or(1).max(4) as f64 + 1.0;
+    let axis_style = Style::default().fg(DIM);
+    let datasets = vec![Dataset::default()
+        .name("pulse")
+        .marker(symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(NEON))
+        .data(&points)];
+    let chart = Chart::new(datasets)
         .block(block)
-        .data(&data)
-        .style(Style::default().fg(NEON));
+        .style(Style::default().bg(BG))
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, width.saturating_sub(1) as f64])
+                .style(axis_style),
+        )
+        .y_axis(Axis::default().bounds([0.0, max_val]).style(axis_style));
 
-    frame.render_widget(sparkline, area);
+    frame.render_widget(chart, area);
 }
 
 fn render_health(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -2019,9 +2060,9 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw("  "),
         Span::styled("[p] Pause", Style::default().fg(DIM)),
         Span::raw("  "),
-        Span::styled("[a] All", all_style),
+        Span::styled("[Ctrl-A] All", all_style),
         Span::raw("  "),
-        Span::styled("[r] Reset", Style::default().fg(DIM)),
+        Span::styled("[Ctrl-H] Help", Style::default().fg(DIM)),
     ]);
 
     let block = Block::default()
@@ -2036,6 +2077,65 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .wrap(Wrap { trim: true });
 
     frame.render_widget(paragraph, area);
+}
+
+fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let popup = centered_rect(60, 60, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled("HELP", Style::default().fg(NEON_HOT)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(DIM))
+        .style(Style::default().bg(BG));
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Keys",
+            Style::default().fg(NEON).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("[q] Quit", Style::default().fg(NEON))),
+        Line::from(Span::styled("[p] Pause/Resume", Style::default().fg(NEON))),
+        Line::from(Span::styled(
+            "[Ctrl-A] Toggle ALL messages",
+            Style::default().fg(NEON),
+        )),
+        Line::from(Span::styled(
+            "[Ctrl-H] Toggle Help",
+            Style::default().fg(NEON),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+
+    frame.render_widget(paragraph, popup);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    let vertical = popup_layout[1];
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical);
+
+    horizontal[1]
 }
 
 fn format_duration(duration: Duration) -> String {

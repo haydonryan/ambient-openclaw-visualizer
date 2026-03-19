@@ -1790,7 +1790,7 @@ fn read_demo(tx: mpsc::Sender<GatewayMessage>) {
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let size = frame.size();
+    let size = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2281,7 +2281,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .saturating_add(app.input.chars().count() as u16);
     let cursor_y = inner.y;
     if cursor_x < area.right().saturating_sub(1) {
-        frame.set_cursor(cursor_x, cursor_y);
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 

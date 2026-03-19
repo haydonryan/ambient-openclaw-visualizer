@@ -7,32 +7,34 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::{
-    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64URL},
     Engine,
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64URL},
 };
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use crossterm::{cursor, execute};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::Rng;
 use rand::rngs::OsRng;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
 use ratatui::symbols;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, Paragraph, Wrap};
-use ratatui::Terminal;
-use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tungstenite::client::{uri_mode, IntoClientRequest};
+use tungstenite::client::{IntoClientRequest, uri_mode};
 use tungstenite::error::{Error as WsError, UrlError};
 use tungstenite::handshake::client::Response as WsResponse;
+use tungstenite::http::header::{AUTHORIZATION, HeaderName};
 use tungstenite::stream::{MaybeTlsStream, Mode};
-use tungstenite::http::header::{HeaderName, AUTHORIZATION};
-use tungstenite::{client_tls_with_config, connect, Connector, HandshakeError, Message, WebSocket};
+use tungstenite::{Connector, HandshakeError, Message, WebSocket, client_tls_with_config, connect};
 use url::Url;
 use uuid::Uuid;
 
@@ -45,7 +47,11 @@ const PULSE_HISTORY_LEN: usize = 120;
 const PULSE_SAMPLE_MIN_MS: u64 = 700;
 
 #[derive(Parser, Debug)]
-#[command(name = "openclaw-visualizer", version, about = "OpenClaw gateway cyberpunk visualizer")]
+#[command(
+    name = "openclaw-visualizer",
+    version,
+    about = "OpenClaw gateway cyberpunk visualizer"
+)]
 struct Args {
     /// WebSocket gateway URL, e.g. ws://127.0.0.1:9001
     #[arg(long)]
@@ -80,14 +86,6 @@ struct Args {
     active_minutes: u64,
 }
 
-#[derive(Debug, Clone)]
-struct GatewayEvent {
-    at: Instant,
-    raw: String,
-    event_type: String,
-    status: String,
-}
-
 #[derive(Debug)]
 enum GatewayMessage {
     Line(String),
@@ -96,7 +94,10 @@ enum GatewayMessage {
 
 #[derive(Debug, Clone)]
 enum GatewayCommand {
-    SendChat { session_key: String, message: String },
+    SendChat {
+        session_key: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -132,17 +133,9 @@ impl Default for TranscriptEntry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Settings {
     show_all_messages: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            show_all_messages: false,
-        }
-    }
 }
 
 struct App {
@@ -153,7 +146,6 @@ struct App {
     errors: u64,
     unique_devices: HashSet<String>,
     types: HashMap<String, u64>,
-    recent: VecDeque<GatewayEvent>,
     transcript: VecDeque<TranscriptEntry>,
     status: String,
     connection: String,
@@ -188,7 +180,6 @@ impl App {
             errors: 0,
             unique_devices: HashSet::new(),
             types: HashMap::new(),
-            recent: VecDeque::with_capacity(200),
             transcript: VecDeque::with_capacity(2000),
             status: "Awaiting telemetry...".to_string(),
             connection,
@@ -294,19 +285,19 @@ impl App {
         self.last_event_at = Some(now);
         self.throughput_window.push_back(now);
         self.record_pulse(now, false);
-        if let Some(text) = display_text {
-            if !text.is_empty() {
-                if self.show_all_messages && !display_is_stream {
-                    let gap_before = self.last_display_was_json_line && is_json_line;
-                    self.append_transcript_line(&text, now, gap_before);
-                    self.last_display_was_json_line = is_json_line;
-                } else {
-                    self.append_transcript(&text, now);
-                    self.last_display_was_json_line = false;
-                }
-                if let Some(last) = self.transcript.back() {
-                    self.last_line = last.text.clone();
-                }
+        if let Some(text) = display_text
+            && !text.is_empty()
+        {
+            if self.show_all_messages && !display_is_stream {
+                let gap_before = self.last_display_was_json_line && is_json_line;
+                self.append_transcript_line(&text, now, gap_before);
+                self.last_display_was_json_line = is_json_line;
+            } else {
+                self.append_transcript(&text, now);
+                self.last_display_was_json_line = false;
+            }
+            if let Some(last) = self.transcript.back() {
+                self.last_line = last.text.clone();
             }
         }
     }
@@ -365,20 +356,20 @@ impl App {
             self.transcript.push_back(TranscriptEntry::default());
         }
         if want_gap {
-            if let Some(last) = self.transcript.back() {
-                if !last.text.is_empty() {
-                    self.transcript.push_back(TranscriptEntry::default());
-                }
-            }
-            if let Some(last) = self.transcript.back() {
-                if last.text.is_empty() {
-                    self.transcript.push_back(TranscriptEntry::default());
-                }
-            }
-        } else if let Some(last) = self.transcript.back() {
-            if !last.text.is_empty() {
+            if let Some(last) = self.transcript.back()
+                && !last.text.is_empty()
+            {
                 self.transcript.push_back(TranscriptEntry::default());
             }
+            if let Some(last) = self.transcript.back()
+                && last.text.is_empty()
+            {
+                self.transcript.push_back(TranscriptEntry::default());
+            }
+        } else if let Some(last) = self.transcript.back()
+            && !last.text.is_empty()
+        {
+            self.transcript.push_back(TranscriptEntry::default());
         }
         if let Some(last) = self.transcript.back_mut() {
             last.text.push_str(line);
@@ -393,10 +384,10 @@ impl App {
         if self.transcript.is_empty() {
             self.transcript.push_back(TranscriptEntry::default());
         }
-        if let Some(last) = self.transcript.back() {
-            if !last.text.is_empty() {
-                self.transcript.push_back(TranscriptEntry::default());
-            }
+        if let Some(last) = self.transcript.back()
+            && !last.text.is_empty()
+        {
+            self.transcript.push_back(TranscriptEntry::default());
         }
         let tokens = estimate_tokens(message);
         if tokens > 0 {
@@ -417,7 +408,10 @@ impl App {
     }
 
     fn record_pulse(&mut self, now: Instant, force: bool) {
-        if !force && now.duration_since(self.last_pulse_sample) < Duration::from_millis(PULSE_SAMPLE_MIN_MS) {
+        if !force
+            && now.duration_since(self.last_pulse_sample)
+                < Duration::from_millis(PULSE_SAMPLE_MIN_MS)
+        {
             return;
         }
         let pulse = self.throughput_window.len() as u64;
@@ -556,10 +550,7 @@ fn main() -> io::Result<()> {
     let args = Args::parse();
 
     let dotenv_map = read_dotenv_file(Path::new(".env"));
-    let env_gateway = lookup_env(
-        &dotenv_map,
-        &["openclaw-endpoint", "OPENCLAW_ENDPOINT"],
-    );
+    let env_gateway = lookup_env(&dotenv_map, &["openclaw-endpoint", "OPENCLAW_ENDPOINT"]);
     let env_token = lookup_env(
         &dotenv_map,
         &[
@@ -569,8 +560,10 @@ fn main() -> io::Result<()> {
             "OPENCLAW_GATEWAY_TOKEN",
         ],
     );
-    let env_insecure_tls =
-        lookup_env(&dotenv_map, &["openclaw-insecure-tls", "OPENCLAW_INSECURE_TLS"]);
+    let env_insecure_tls = lookup_env(
+        &dotenv_map,
+        &["openclaw-insecure-tls", "OPENCLAW_INSECURE_TLS"],
+    );
 
     let gateway = args
         .gateway
@@ -628,80 +621,78 @@ fn main() -> io::Result<()> {
             }
         }
 
-        if event::poll(Duration::from_millis(0))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    if app.show_help {
-                        app.show_help = false;
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => break,
-                        KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
-                            app.paused = !app.paused
-                        }
-                        KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
-                            app.show_all_messages = !app.show_all_messages;
-                            let settings = Settings {
-                                show_all_messages: app.show_all_messages,
-                            };
-                            if let Err(err) = save_settings(&app.settings_path, &settings) {
-                                app.status = format!("Settings save failed: {err}");
-                            } else {
-                                app.status = if app.show_all_messages {
-                                    "Display: ALL messages".to_string()
-                                } else {
-                                    "Display: text only".to_string()
-                                };
-                            }
-                        }
-                        KeyCode::Char('h') if key.modifiers == KeyModifiers::CONTROL => {
-                            app.show_help = !app.show_help;
-                        }
-                        KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
-                            if !allow_input {
-                                app.status = "Message input only works with --gateway".to_string();
-                                continue;
-                            }
-                            let now = Instant::now();
-                            let message = app.input.trim().to_string();
-                            if message.is_empty() {
-                                continue;
-                            }
-                            match command_tx.send(GatewayCommand::SendChat {
-                                session_key: "main".to_string(),
-                                message: message.clone(),
-                            }) {
-                                Ok(_) => {
-                                    app.append_local_user_message(&message, now);
-                                    app.status = "Queued message for main agent".to_string();
-                                    app.input.clear();
-                                }
-                                Err(err) => {
-                                    app.status = format!("Send queue failed: {err}");
-                                }
-                            }
-                        }
-                        KeyCode::Backspace if key.modifiers == KeyModifiers::NONE => {
-                            app.input.pop();
-                        }
-                        KeyCode::Esc if key.modifiers == KeyModifiers::NONE => {
-                            app.input.clear();
-                        }
-                        KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
-                            app.input.clear();
-                        }
-                        KeyCode::Char(ch)
-                            if key.modifiers.is_empty()
-                                || key.modifiers == KeyModifiers::SHIFT =>
-                        {
-                            if allow_input {
-                                app.input.push(ch);
-                            }
-                        }
-                        _ => {}
+        if event::poll(Duration::from_millis(0))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            if app.show_help {
+                app.show_help = false;
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => break,
+                KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                    app.paused = !app.paused
+                }
+                KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
+                    app.show_all_messages = !app.show_all_messages;
+                    let settings = Settings {
+                        show_all_messages: app.show_all_messages,
+                    };
+                    if let Err(err) = save_settings(&app.settings_path, &settings) {
+                        app.status = format!("Settings save failed: {err}");
+                    } else {
+                        app.status = if app.show_all_messages {
+                            "Display: ALL messages".to_string()
+                        } else {
+                            "Display: text only".to_string()
+                        };
                     }
                 }
+                KeyCode::Char('h') if key.modifiers == KeyModifiers::CONTROL => {
+                    app.show_help = !app.show_help;
+                }
+                KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                    if !allow_input {
+                        app.status = "Message input only works with --gateway".to_string();
+                        continue;
+                    }
+                    let now = Instant::now();
+                    let message = app.input.trim().to_string();
+                    if message.is_empty() {
+                        continue;
+                    }
+                    match command_tx.send(GatewayCommand::SendChat {
+                        session_key: "main".to_string(),
+                        message: message.clone(),
+                    }) {
+                        Ok(_) => {
+                            app.append_local_user_message(&message, now);
+                            app.status = "Queued message for main agent".to_string();
+                            app.input.clear();
+                        }
+                        Err(err) => {
+                            app.status = format!("Send queue failed: {err}");
+                        }
+                    }
+                }
+                KeyCode::Backspace if key.modifiers == KeyModifiers::NONE => {
+                    app.input.pop();
+                }
+                KeyCode::Esc if key.modifiers == KeyModifiers::NONE => {
+                    app.input.clear();
+                }
+                KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                    app.input.clear();
+                }
+                KeyCode::Char(ch)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    if allow_input {
+                        app.input.push(ch);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -867,8 +858,7 @@ fn read_websocket(
                                         send_status(
                                             &tx,
                                             debug,
-                                            "Challenge missing ts; cannot authenticate"
-                                                .to_string(),
+                                            "Challenge missing ts; cannot authenticate".to_string(),
                                         );
                                         continue;
                                     };
@@ -901,104 +891,98 @@ fn read_websocket(
                                             );
                                         }
                                     }
-                                } else if value.get("type").and_then(|v| v.as_str()) == Some("res") {
-                                    if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
-                                        if connect_id.as_deref() == Some(id) {
-                                            let ok = value
-                                                .get("ok")
-                                                .and_then(|v| v.as_bool())
-                                                .unwrap_or(false);
-                                            if ok {
-                                                send_status(
-                                                    &tx,
-                                                    debug,
-                                                    "Gateway connect accepted".to_string(),
-                                                );
-                                                if !status_sent {
-                                                    let request_id = new_request_id();
-                                                    let message = build_status_request(&request_id);
-                                                    match socket.send(Message::Text(message)) {
-                                                        Ok(_) => {
-                                                            status_sent = true;
-                                                            send_status(
-                                                                &tx,
-                                                                debug,
-                                                                "Requested running agent snapshot".to_string(),
-                                                            );
-                                                        }
-                                                        Err(err) => {
-                                                            send_status(
-                                                                &tx,
-                                                                debug,
-                                                                format!(
-                                                                    "Agent snapshot request failed: {err}"
-                                                                ),
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                if !sessions_sent && active_minutes > 0 {
-                                                    let request_id = new_request_id();
-                                                    let message = build_sessions_list_request(
-                                                        &request_id,
-                                                        active_minutes,
+                                } else if value.get("type").and_then(|v| v.as_str()) == Some("res")
+                                    && let Some(id) = value.get("id").and_then(|v| v.as_str())
+                                    && connect_id.as_deref() == Some(id)
+                                {
+                                    let ok =
+                                        value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    if ok {
+                                        send_status(
+                                            &tx,
+                                            debug,
+                                            "Gateway connect accepted".to_string(),
+                                        );
+                                        if !status_sent {
+                                            let request_id = new_request_id();
+                                            let message = build_status_request(&request_id);
+                                            match socket.send(Message::Text(message)) {
+                                                Ok(_) => {
+                                                    status_sent = true;
+                                                    send_status(
+                                                        &tx,
+                                                        debug,
+                                                        "Requested running agent snapshot"
+                                                            .to_string(),
                                                     );
-                                                    match socket.send(Message::Text(message)) {
-                                                        Ok(_) => {
-                                                            sessions_sent = true;
-                                                            send_status(
-                                                                &tx,
-                                                                debug,
-                                                                format!(
-                                                                    "Requested active sessions (last {}m)",
-                                                                    active_minutes
-                                                                ),
-                                                            );
-                                                        }
-                                                        Err(err) => {
-                                                            send_status(
-                                                                &tx,
-                                                                debug,
-                                                                format!(
-                                                                    "Active sessions request failed: {err}"
-                                                                ),
-                                                            );
-                                                        }
-                                                    }
                                                 }
-                                                if let Some(device_token) = value
-                                                    .get("payload")
-                                                    .and_then(|p| p.get("auth"))
-                                                    .and_then(|a| a.get("deviceToken"))
-                                                    .and_then(|v| v.as_str())
-                                                {
+                                                Err(err) => {
                                                     send_status(
                                                         &tx,
                                                         debug,
                                                         format!(
-                                                            "Device token issued (persist it): {}",
-                                                            device_token
+                                                            "Agent snapshot request failed: {err}"
                                                         ),
                                                     );
                                                 }
-                                            } else {
-                                                let err = value
-                                                    .get("error")
-                                                    .and_then(|v| v.get("message"))
-                                                    .and_then(|v| v.as_str())
-                                                    .or_else(|| {
-                                                        value
-                                                            .get("err")
-                                                            .and_then(|v| v.as_str())
-                                                    })
-                                                    .unwrap_or("unknown error");
-                                                send_status(
-                                                    &tx,
-                                                    debug,
-                                                    format!("Gateway connect rejected: {err}"),
-                                                );
                                             }
                                         }
+                                        if !sessions_sent && active_minutes > 0 {
+                                            let request_id = new_request_id();
+                                            let message = build_sessions_list_request(
+                                                &request_id,
+                                                active_minutes,
+                                            );
+                                            match socket.send(Message::Text(message)) {
+                                                Ok(_) => {
+                                                    sessions_sent = true;
+                                                    send_status(
+                                                        &tx,
+                                                        debug,
+                                                        format!(
+                                                            "Requested active sessions (last {}m)",
+                                                            active_minutes
+                                                        ),
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    send_status(
+                                                        &tx,
+                                                        debug,
+                                                        format!(
+                                                            "Active sessions request failed: {err}"
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        if let Some(device_token) = value
+                                            .get("payload")
+                                            .and_then(|p| p.get("auth"))
+                                            .and_then(|a| a.get("deviceToken"))
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            send_status(
+                                                &tx,
+                                                debug,
+                                                format!(
+                                                    "Device token issued (persist it): {}",
+                                                    device_token
+                                                ),
+                                            );
+                                        }
+                                    } else {
+                                        let err = value
+                                            .get("error")
+                                            .and_then(|v| v.get("message"))
+                                            .and_then(|v| v.as_str())
+                                            .or_else(|| value.get("err").and_then(|v| v.as_str()))
+                                            .unwrap_or("unknown error");
+                                        send_status(
+                                            &tx,
+                                            debug,
+                                            format!("Gateway connect rejected: {err}"),
+                                        );
                                     }
                                 }
                             }
@@ -1097,22 +1081,27 @@ fn is_timeout_error(err: &WsError) -> bool {
     }
 }
 
+type GatewayConnectResult =
+    Result<(WebSocket<MaybeTlsStream<TcpStream>>, WsResponse), Box<WsError>>;
+
 fn connect_gateway<Req: IntoClientRequest>(
     request: Req,
     insecure_tls: bool,
-) -> tungstenite::Result<(WebSocket<MaybeTlsStream<TcpStream>>, WsResponse)> {
+) -> GatewayConnectResult {
     let request = request.into_client_request()?;
     let mode = uri_mode(request.uri())?;
     if !insecure_tls || matches!(mode, Mode::Plain) {
-        return connect(request);
+        return connect(request).map_err(Box::new);
     }
 
     let host = request
         .uri()
         .host()
-        .ok_or(WsError::Url(UrlError::NoHostName))?;
+        .ok_or_else(|| Box::new(WsError::Url(UrlError::NoHostName)))?;
     let port = request.uri().port_u16().unwrap_or(443);
-    let addrs = (host, port).to_socket_addrs()?;
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| Box::new(WsError::Io(err)))?;
     let mut last_err = None;
     let mut stream = None;
     for addr in addrs {
@@ -1128,11 +1117,11 @@ fn connect_gateway<Req: IntoClientRequest>(
         Some(stream) => stream,
         None => {
             if let Some(err) = last_err {
-                return Err(WsError::Io(err));
+                return Err(Box::new(WsError::Io(err)));
             }
-            return Err(WsError::Url(UrlError::UnableToConnect(
+            return Err(Box::new(WsError::Url(UrlError::UnableToConnect(
                 request.uri().to_string(),
-            )));
+            ))));
         }
     };
     let _ = stream.set_nodelay(true);
@@ -1140,20 +1129,15 @@ fn connect_gateway<Req: IntoClientRequest>(
     let connector = native_tls::TlsConnector::builder()
         .danger_accept_invalid_certs(true)
         .build()
-        .map_err(|err| WsError::Tls(err.into()))?;
-    let client = client_tls_with_config(
-        request,
-        stream,
-        None,
-        Some(Connector::NativeTls(connector)),
-    );
+        .map_err(|err| Box::new(WsError::Tls(err.into())))?;
+    let client =
+        client_tls_with_config(request, stream, None, Some(Connector::NativeTls(connector)));
     match client {
         Ok(result) => Ok(result),
-        Err(HandshakeError::Failure(f)) => Err(f),
-        Err(HandshakeError::Interrupted(_)) => Err(WsError::Io(io::Error::new(
-            io::ErrorKind::Other,
+        Err(HandshakeError::Failure(f)) => Err(Box::new(f)),
+        Err(HandshakeError::Interrupted(_)) => Err(Box::new(WsError::Io(io::Error::other(
             "TLS handshake interrupted",
-        ))),
+        )))),
     }
 }
 
@@ -1180,15 +1164,13 @@ fn load_or_create_device_identity() -> (String, SigningKey) {
     let config_dir = get_config_dir();
     let device_file = config_dir.join("device.json");
 
-    if let Ok(contents) = std::fs::read_to_string(&device_file) {
-        if let Ok(identity) = serde_json::from_str::<DeviceIdentity>(&contents) {
-            if let Ok(key_bytes) = BASE64.decode(&identity.private_key) {
-                if let Ok(key_array) = key_bytes.try_into() {
-                    let signing_key = SigningKey::from_bytes(&key_array);
-                    return (derive_device_id(&signing_key), signing_key);
-                }
-            }
-        }
+    if let Ok(contents) = std::fs::read_to_string(&device_file)
+        && let Ok(identity) = serde_json::from_str::<DeviceIdentity>(&contents)
+        && let Ok(key_bytes) = BASE64.decode(&identity.private_key)
+        && let Ok(key_array) = key_bytes.try_into()
+    {
+        let signing_key = SigningKey::from_bytes(&key_array);
+        return (derive_device_id(&signing_key), signing_key);
     }
 
     let signing_key = SigningKey::generate(&mut OsRng);
@@ -1199,7 +1181,10 @@ fn load_or_create_device_identity() -> (String, SigningKey) {
     };
 
     let _ = std::fs::create_dir_all(&config_dir);
-    let _ = std::fs::write(&device_file, serde_json::to_string_pretty(&identity).unwrap());
+    let _ = std::fs::write(
+        &device_file,
+        serde_json::to_string_pretty(&identity).unwrap(),
+    );
 
     (device_id, signing_key)
 }
@@ -1293,15 +1278,15 @@ fn build_chat_send_request(request_id: &str, session_key: &str, message: &str) -
 
 fn lookup_env(dotenv_map: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
     for key in keys {
-        if let Ok(value) = std::env::var(key) {
-            if !value.is_empty() {
-                return Some(value);
-            }
+        if let Ok(value) = std::env::var(key)
+            && !value.is_empty()
+        {
+            return Some(value);
         }
-        if let Some(value) = dotenv_map.get(*key) {
-            if !value.is_empty() {
-                return Some(value.clone());
-            }
+        if let Some(value) = dotenv_map.get(*key)
+            && !value.is_empty()
+        {
+            return Some(value.clone());
         }
     }
     None
@@ -1319,11 +1304,7 @@ fn parse_bool(value: Option<String>) -> bool {
 
 fn estimate_tokens(text: &str) -> usize {
     let non_ws = text.chars().filter(|c| !c.is_whitespace()).count();
-    if non_ws == 0 {
-        0
-    } else {
-        (non_ws + 3) / 4
-    }
+    if non_ws == 0 { 0 } else { non_ws.div_ceil(4) }
 }
 
 fn status_style_for(status: &str) -> Style {
@@ -1390,7 +1371,11 @@ fn collect_running_agents(payload: &Value, out: &mut Vec<(String, String)>) {
     }
 }
 
-fn collect_running_from_array(entries: &[Value], out: &mut Vec<(String, String)>, require_status: bool) {
+fn collect_running_from_array(
+    entries: &[Value],
+    out: &mut Vec<(String, String)>,
+    require_status: bool,
+) {
     for entry in entries {
         if let Some(value) = extract_running_from_value(entry, require_status) {
             out.push(value);
@@ -1476,17 +1461,14 @@ fn extract_running_from_value(entry: &Value, require_status: bool) -> Option<(St
         .or_else(|| obj.get("phase").and_then(|v| v.as_str()))
         .or_else(|| obj.get("state").and_then(|v| v.as_str()));
     let status = raw_status.map(normalize_agent_status);
-    let active_by_status = status
-        .as_deref()
-        .map(is_active_status)
-        .unwrap_or(false);
+    let active_by_status = status.as_deref().map(is_active_status).unwrap_or(false);
     if require_status && !active_by_status && !matches!(active_flag, Some(true)) {
         return None;
     }
-    if let Some(ref normalized) = status {
-        if !is_active_status(normalized) {
-            return None;
-        }
+    if let Some(ref normalized) = status
+        && !is_active_status(normalized)
+    {
+        return None;
     }
 
     let id = obj
@@ -1514,7 +1496,10 @@ fn extract_running_from_session(session: &Value) -> Option<(String, String)> {
         return None;
     }
 
-    let has_run = obj.get("activeRunId").or_else(|| obj.get("runId")).is_some();
+    let has_run = obj
+        .get("activeRunId")
+        .or_else(|| obj.get("runId"))
+        .is_some();
     if !has_run {
         return None;
     }
@@ -1546,18 +1531,11 @@ fn is_root_agent(id: &str) -> bool {
 }
 
 fn is_guid_like(value: &str) -> bool {
-    value.contains('-')
-        && value
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == '-')
+    value.contains('-') && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 fn shorten_guid(value: &str) -> String {
-    value
-        .rsplit('-')
-        .next()
-        .unwrap_or(value)
-        .to_string()
+    value.rsplit('-').next().unwrap_or(value).to_string()
 }
 
 fn shorten_session_key(value: &str) -> String {
@@ -1620,17 +1598,17 @@ fn pulse_series(history: &VecDeque<u64>, width: usize) -> Vec<u64> {
     } else {
         let mut data = Vec::with_capacity(width);
         let pad = width - history.len();
-        data.extend(std::iter::repeat(0).take(pad));
+        data.extend(std::iter::repeat_n(0, pad));
         data.extend(history.iter().copied());
         data
     }
 }
 
 fn extract_gateway_domain(connection: &str) -> String {
-    if let Ok(url) = Url::parse(connection) {
-        if let Some(host) = url.host_str() {
-            return host.to_string();
-        }
+    if let Ok(url) = Url::parse(connection)
+        && let Some(host) = url.host_str()
+    {
+        return host.to_string();
     }
     if connection.starts_with("ws://") || connection.starts_with("wss://") {
         return connection
@@ -1697,10 +1675,7 @@ fn pad_right(text: &str, width: usize) -> String {
     out
 }
 
-fn extract_display_text(
-    value: &Value,
-    cache: &mut HashMap<String, String>,
-) -> Option<String> {
+fn extract_display_text(value: &Value, cache: &mut HashMap<String, String>) -> Option<String> {
     let msg_type = value.get("type").and_then(|v| v.as_str());
     let event = value.get("event").and_then(|v| v.as_str());
 
@@ -1710,16 +1685,19 @@ fn extract_display_text(
         if stream != "assistant" {
             return None;
         }
-        let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let run_id = payload
+            .get("runId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         let key = format!("{run_id}:{stream}");
         let data = payload.get("data")?;
 
-        if let Some(delta) = data.get("delta").and_then(|v| v.as_str()) {
-            if !delta.is_empty() {
-                let entry = cache.entry(key).or_default();
-                entry.push_str(delta);
-                return Some(delta.to_string());
-            }
+        if let Some(delta) = data.get("delta").and_then(|v| v.as_str())
+            && !delta.is_empty()
+        {
+            let entry = cache.entry(key).or_default();
+            entry.push_str(delta);
+            return Some(delta.to_string());
         }
 
         if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
@@ -1850,15 +1828,10 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Style::default().fg(DIM)
     };
     let help_text = "Ctrl-H Help";
-    let left_len = title_text.chars().count()
-        + 2
-        + gateway.chars().count()
-        + 2
-        + uptime_text.chars().count();
+    let left_len =
+        title_text.chars().count() + 2 + gateway.chars().count() + 2 + uptime_text.chars().count();
     let right_len = 3 + 2 + help_text.chars().count();
-    let pad = inner_width
-        .saturating_sub(left_len + right_len)
-        .max(1);
+    let pad = inner_width.saturating_sub(left_len + right_len).max(1);
     let header = Line::from(vec![
         Span::styled(title_text, title_style),
         Span::raw("  "),
@@ -1993,12 +1966,14 @@ fn render_pulse(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .collect();
     let max_val = data.iter().copied().max().unwrap_or(1).max(4) as f64 + 1.0;
     let axis_style = Style::default().fg(DIM);
-    let datasets = vec![Dataset::default()
-        .name("pulse")
-        .marker(symbols::Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::default().fg(NEON))
-        .data(&points)];
+    let datasets = vec![
+        Dataset::default()
+            .name("pulse")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(NEON))
+            .data(&points),
+    ];
     let chart = Chart::new(datasets)
         .block(block)
         .style(Style::default().bg(BG))
@@ -2015,14 +1990,20 @@ fn render_pulse(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn render_health(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     let block = Block::default()
-        .title(Span::styled("GATEWAY HEALTH", Style::default().fg(NEON_HOT)))
+        .title(Span::styled(
+            "GATEWAY HEALTH",
+            Style::default().fg(NEON_HOT),
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM))
         .style(Style::default().bg(BG));
 
     let (health_label, health_style) = match app.gateway_health_ok {
         Some(true) => ("OK", Style::default().fg(NEON).add_modifier(Modifier::BOLD)),
-        Some(false) => ("DEGRADED", Style::default().fg(ALERT).add_modifier(Modifier::BOLD)),
+        Some(false) => (
+            "DEGRADED",
+            Style::default().fg(ALERT).add_modifier(Modifier::BOLD),
+        ),
         None => ("UNKNOWN", Style::default().fg(DIM)),
     };
     let last = app
@@ -2102,7 +2083,11 @@ fn render_health(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 };
                 label = strip_agent_prefix(&shorten_session_key(&label));
                 let age = format_duration(child_state.last_at.elapsed());
-                let connector = if idx + 1 == children.len() { "└" } else { "├" };
+                let connector = if idx + 1 == children.len() {
+                    "└"
+                } else {
+                    "├"
+                };
                 agent_lines.push((
                     format!("{connector} {label}"),
                     child_state.status.clone(),
@@ -2175,11 +2160,11 @@ fn render_health(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let mut end = app.transcript.len();
     while end > 0 {
-        if let Some(last) = app.transcript.get(end - 1) {
-            if last.text.is_empty() {
-                end = end.saturating_sub(1);
-                continue;
-            }
+        if let Some(last) = app.transcript.get(end - 1)
+            && last.text.is_empty()
+        {
+            end = end.saturating_sub(1);
+            continue;
         }
         break;
     }
@@ -2268,14 +2253,14 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let prompt_style = Style::default().fg(NEON_HOT).add_modifier(Modifier::BOLD);
     let input_text = if app.input.is_empty() {
-        Span::styled("Type a message for the main agent...", Style::default().fg(DIM))
+        Span::styled(
+            "Type a message for the main agent...",
+            Style::default().fg(DIM),
+        )
     } else {
         Span::styled(app.input.clone(), Style::default().fg(NEON))
     };
-    let input_line = Line::from(vec![
-        Span::styled("> ", prompt_style),
-        input_text,
-    ]);
+    let input_line = Line::from(vec![Span::styled("> ", prompt_style), input_text]);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2316,12 +2301,24 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
             Style::default().fg(NEON).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled("Type to compose a message to session `main`", Style::default().fg(NEON))),
-        Line::from(Span::styled("[Enter] Send message", Style::default().fg(NEON))),
+        Line::from(Span::styled(
+            "Type to compose a message to session `main`",
+            Style::default().fg(NEON),
+        )),
+        Line::from(Span::styled(
+            "[Enter] Send message",
+            Style::default().fg(NEON),
+        )),
         Line::from(Span::styled("[Esc] Clear input", Style::default().fg(NEON))),
-        Line::from(Span::styled("[Ctrl-U] Clear input", Style::default().fg(NEON))),
+        Line::from(Span::styled(
+            "[Ctrl-U] Clear input",
+            Style::default().fg(NEON),
+        )),
         Line::from(Span::styled("[Ctrl-D] Quit", Style::default().fg(NEON))),
-        Line::from(Span::styled("[Ctrl-P] Pause/Resume", Style::default().fg(NEON))),
+        Line::from(Span::styled(
+            "[Ctrl-P] Pause/Resume",
+            Style::default().fg(NEON),
+        )),
         Line::from(Span::styled(
             "[Ctrl-A] Toggle ALL messages",
             Style::default().fg(NEON),

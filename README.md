@@ -57,3 +57,11 @@ Environment variables are read from `.env` and the process environment. CLI flag
 ```sh
 cargo build --release
 ```
+
+## Development
+
+Enable the repo's pre-commit hook to run formatting, clippy, and tests before each commit:
+
+```bash
+git config core.hooksPath .githooks
+```

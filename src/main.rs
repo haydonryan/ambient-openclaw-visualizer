@@ -1,3 +1,15 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::manual_let_else,
+    clippy::match_same_arms,
+    clippy::needless_pass_by_value,
+    clippy::option_if_let_else,
+    clippy::struct_excessive_bools,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps
+)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, BufReader};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -53,7 +65,7 @@ const PULSE_SAMPLE_MIN_MS: u64 = 700;
     about = "OpenClaw gateway cyberpunk visualizer"
 )]
 struct Args {
-    /// WebSocket gateway URL, e.g. ws://127.0.0.1:9001
+    /// WebSocket gateway URL, e.g. <ws://127.0.0.1:9001>
     #[arg(long)]
     gateway: Option<String>,
 
@@ -251,9 +263,9 @@ impl App {
                 device_id = Some(val.to_string());
             }
 
-            if let Some(val) = value.get("latency_ms").and_then(|v| v.as_f64()) {
+            if let Some(val) = value.get("latency_ms").and_then(serde_json::Value::as_f64) {
                 latency_ms = Some(val);
-            } else if let Some(val) = value.get("latency").and_then(|v| v.as_f64()) {
+            } else if let Some(val) = value.get("latency").and_then(serde_json::Value::as_f64) {
                 latency_ms = Some(val);
             }
         } else {
@@ -265,7 +277,7 @@ impl App {
                 event_type = "telemetry".to_string();
             }
             if self.show_all_messages {
-                display_text = Some(line.clone());
+                display_text = Some(line);
             }
         }
 
@@ -276,7 +288,7 @@ impl App {
             self.last_latency_ms = Some(latency);
         }
 
-        *self.types.entry(event_type.clone()).or_insert(0) += 1;
+        *self.types.entry(event_type).or_insert(0) += 1;
         if status.contains("err") || status.contains("fail") || status.contains("crit") {
             self.errors += 1;
         }
@@ -433,15 +445,15 @@ impl App {
             let ok = value
                 .get("payload")
                 .and_then(|p| p.get("ok"))
-                .and_then(|v| v.as_bool());
+                .and_then(serde_json::Value::as_bool);
             self.gateway_health_ok = ok;
             self.gateway_health_at = Some(Instant::now());
             if let Some(duration) = value
                 .get("payload")
                 .and_then(|p| p.get("durationMs"))
-                .and_then(|v| v.as_i64())
+                .and_then(serde_json::Value::as_i64)
             {
-                self.gateway_health_note = format!("{}ms", duration);
+                self.gateway_health_note = format!("{duration}ms");
             } else {
                 self.gateway_health_note.clear();
             }
@@ -540,13 +552,13 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+        drop(disable_raw_mode());
+        drop(execute!(io::stdout(), LeaveAlternateScreen, cursor::Show));
     }
 }
 
 fn main() -> io::Result<()> {
-    dotenvy::dotenv().ok();
+    drop(dotenvy::dotenv());
     let args = Args::parse();
 
     let dotenv_map = read_dotenv_file(Path::new(".env"));
@@ -579,8 +591,8 @@ fn main() -> io::Result<()> {
         Source::Stdin
     } else {
         Source::WebSocket {
-            url: gateway.clone(),
-            token: token.clone(),
+            url: gateway,
+            token,
             insecure_tls,
             debug: args.debug,
             active_minutes: args.active_minutes,
@@ -632,7 +644,7 @@ fn main() -> io::Result<()> {
             match key.code {
                 KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => break,
                 KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
-                    app.paused = !app.paused
+                    app.paused = !app.paused;
                 }
                 KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
                     app.show_all_messages = !app.show_all_messages;
@@ -666,7 +678,7 @@ fn main() -> io::Result<()> {
                         session_key: "main".to_string(),
                         message: message.clone(),
                     }) {
-                        Ok(_) => {
+                        Ok(()) => {
                             app.append_local_user_message(&message, now);
                             app.status = "Queued message for main agent".to_string();
                             app.input.clear();
@@ -686,11 +698,10 @@ fn main() -> io::Result<()> {
                     app.input.clear();
                 }
                 KeyCode::Char(ch)
-                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                    if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                        && allow_input =>
                 {
-                    if allow_input {
-                        app.input.push(ch);
-                    }
+                    app.input.push(ch);
                 }
                 _ => {}
             }
@@ -830,11 +841,11 @@ fn read_websocket(
                                         .get("payload")
                                         .and_then(|p| p.get("nonce"))
                                         .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string());
+                                        .map(std::string::ToString::to_string);
                                     let ts = value
                                         .get("payload")
                                         .and_then(|p| p.get("ts"))
-                                        .and_then(|v| v.as_u64());
+                                        .and_then(serde_json::Value::as_u64);
 
                                     let Some(token) = &token else {
                                         send_status(
@@ -874,12 +885,11 @@ fn read_websocket(
                                     );
                                     if debug {
                                         eprintln!(
-                                            "[openclaw] connect params: client_id=cli, client_mode=cli, role=operator, scopes=operator.read,operator.write,operator.admin, device_id={}",
-                                            device_id
+                                            "[openclaw] connect params: client_id=cli, client_mode=cli, role=operator, scopes=operator.read,operator.write,operator.admin, device_id={device_id}"
                                         );
                                     }
                                     match socket.send(Message::Text(message)) {
-                                        Ok(_) => {
+                                        Ok(()) => {
                                             connect_sent = true;
                                             send_status(&tx, debug, "Sent connect request".into());
                                         }
@@ -895,8 +905,10 @@ fn read_websocket(
                                     && let Some(id) = value.get("id").and_then(|v| v.as_str())
                                     && connect_id.as_deref() == Some(id)
                                 {
-                                    let ok =
-                                        value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    let ok = value
+                                        .get("ok")
+                                        .and_then(serde_json::Value::as_bool)
+                                        .unwrap_or(false);
                                     if ok {
                                         send_status(
                                             &tx,
@@ -907,7 +919,7 @@ fn read_websocket(
                                             let request_id = new_request_id();
                                             let message = build_status_request(&request_id);
                                             match socket.send(Message::Text(message)) {
-                                                Ok(_) => {
+                                                Ok(()) => {
                                                     status_sent = true;
                                                     send_status(
                                                         &tx,
@@ -934,14 +946,13 @@ fn read_websocket(
                                                 active_minutes,
                                             );
                                             match socket.send(Message::Text(message)) {
-                                                Ok(_) => {
+                                                Ok(()) => {
                                                     sessions_sent = true;
                                                     send_status(
                                                         &tx,
                                                         debug,
                                                         format!(
-                                                            "Requested active sessions (last {}m)",
-                                                            active_minutes
+                                                            "Requested active sessions (last {active_minutes}m)"
                                                         ),
                                                     );
                                                 }
@@ -966,8 +977,7 @@ fn read_websocket(
                                                 &tx,
                                                 debug,
                                                 format!(
-                                                    "Device token issued (persist it): {}",
-                                                    device_token
+                                                    "Device token issued (persist it): {device_token}"
                                                 ),
                                             );
                                         }
@@ -986,14 +996,14 @@ fn read_websocket(
                                     }
                                 }
                             }
-                            let _ = tx.send(GatewayMessage::Line(text));
+                            drop(tx.send(GatewayMessage::Line(text)));
                         }
                         Ok(Message::Binary(data)) => {
                             let preview = format!("binary:{} bytes", data.len());
-                            let _ = tx.send(GatewayMessage::Line(preview));
+                            drop(tx.send(GatewayMessage::Line(preview)));
                         }
                         Ok(Message::Ping(payload)) => {
-                            let _ = socket.send(Message::Pong(payload));
+                            drop(socket.send(Message::Pong(payload)));
                         }
                         Ok(Message::Pong(_)) => {}
                         Ok(Message::Close(_)) => {
@@ -1030,7 +1040,7 @@ fn send_status(tx: &mpsc::Sender<GatewayMessage>, debug: bool, message: String) 
     if debug {
         eprintln!("[openclaw] {message}");
     }
-    let _ = tx.send(GatewayMessage::Status(message));
+    drop(tx.send(GatewayMessage::Status(message)));
 }
 
 fn handle_gateway_command(
@@ -1047,7 +1057,7 @@ fn handle_gateway_command(
             let request_id = new_request_id();
             let payload = build_chat_send_request(&request_id, &session_key, &message);
             match socket.send(Message::Text(payload)) {
-                Ok(_) => {
+                Ok(()) => {
                     send_status(tx, debug, format!("Sent chat.send to {session_key}"));
                 }
                 Err(err) => {
@@ -1062,10 +1072,10 @@ fn configure_socket_timeouts(stream: &mut MaybeTlsStream<TcpStream>) {
     let timeout = Some(Duration::from_millis(100));
     match stream {
         MaybeTlsStream::Plain(inner) => {
-            let _ = inner.set_read_timeout(timeout);
+            drop(inner.set_read_timeout(timeout));
         }
         MaybeTlsStream::NativeTls(inner) => {
-            let _ = inner.get_mut().set_read_timeout(timeout);
+            drop(inner.get_mut().set_read_timeout(timeout));
         }
         _ => {}
     }
@@ -1113,18 +1123,17 @@ fn connect_gateway<Req: IntoClientRequest>(
             Err(err) => last_err = Some(err),
         }
     }
-    let stream = match stream {
-        Some(stream) => stream,
-        None => {
-            if let Some(err) = last_err {
-                return Err(Box::new(WsError::Io(err)));
-            }
-            return Err(Box::new(WsError::Url(UrlError::UnableToConnect(
-                request.uri().to_string(),
-            ))));
+    let stream = if let Some(stream) = stream {
+        stream
+    } else {
+        if let Some(err) = last_err {
+            return Err(Box::new(WsError::Io(err)));
         }
+        return Err(Box::new(WsError::Url(UrlError::UnableToConnect(
+            request.uri().to_string(),
+        ))));
     };
-    let _ = stream.set_nodelay(true);
+    drop(stream.set_nodelay(true));
 
     let connector = native_tls::TlsConnector::builder()
         .danger_accept_invalid_certs(true)
@@ -1180,11 +1189,11 @@ fn load_or_create_device_identity() -> (String, SigningKey) {
         public_key: BASE64.encode(signing_key.verifying_key().as_bytes()),
     };
 
-    let _ = std::fs::create_dir_all(&config_dir);
-    let _ = std::fs::write(
+    drop(std::fs::create_dir_all(&config_dir));
+    drop(std::fs::write(
         &device_file,
         serde_json::to_string_pretty(&identity).unwrap(),
-    );
+    ));
 
     (device_id, signing_key)
 }
@@ -1201,8 +1210,7 @@ fn build_connect_request(
     let public_key_b64 = BASE64URL.encode(public_key.as_bytes());
 
     let payload = format!(
-        "v2|{}|cli|cli|operator|operator.read,operator.write,operator.admin|{}|{}|{}",
-        device_id, ts, token, nonce
+        "v2|{device_id}|cli|cli|operator|operator.read,operator.write,operator.admin|{ts}|{token}|{nonce}"
     );
     let signature = signing_key.sign(payload.as_bytes());
     let signature_b64 = BASE64URL.encode(signature.to_bytes());
@@ -1415,7 +1423,7 @@ fn extract_active_session(entry: &Value) -> Option<(String, String)> {
     }
     let obj = entry.as_object()?;
 
-    if obj.get("active").and_then(|v| v.as_bool()) == Some(false) {
+    if obj.get("active").and_then(serde_json::Value::as_bool) == Some(false) {
         return None;
     }
 
@@ -1431,9 +1439,7 @@ fn extract_active_session(entry: &Value) -> Option<(String, String)> {
         .and_then(|v| v.as_str())
         .or_else(|| obj.get("phase").and_then(|v| v.as_str()))
         .or_else(|| obj.get("state").and_then(|v| v.as_str()));
-    let status = raw_status
-        .map(normalize_agent_status)
-        .unwrap_or_else(|| "RUNNING".to_string());
+    let status = raw_status.map_or_else(|| "RUNNING".to_string(), normalize_agent_status);
 
     Some((id.to_string(), status))
 }
@@ -1449,8 +1455,8 @@ fn extract_running_from_value(entry: &Value, require_status: bool) -> Option<(St
 
     let active_flag = obj
         .get("active")
-        .and_then(|v| v.as_bool())
-        .or_else(|| obj.get("running").and_then(|v| v.as_bool()));
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| obj.get("running").and_then(serde_json::Value::as_bool));
     if matches!(active_flag, Some(false)) {
         return None;
     }
@@ -1461,7 +1467,7 @@ fn extract_running_from_value(entry: &Value, require_status: bool) -> Option<(St
         .or_else(|| obj.get("phase").and_then(|v| v.as_str()))
         .or_else(|| obj.get("state").and_then(|v| v.as_str()));
     let status = raw_status.map(normalize_agent_status);
-    let active_by_status = status.as_deref().map(is_active_status).unwrap_or(false);
+    let active_by_status = status.as_deref().is_some_and(is_active_status);
     if require_status && !active_by_status && !matches!(active_flag, Some(true)) {
         return None;
     }
@@ -1490,8 +1496,8 @@ fn extract_running_from_session(session: &Value) -> Option<(String, String)> {
     let obj = session.as_object()?;
     let active_flag = obj
         .get("active")
-        .and_then(|v| v.as_bool())
-        .or_else(|| obj.get("running").and_then(|v| v.as_bool()));
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| obj.get("running").and_then(serde_json::Value::as_bool));
     if matches!(active_flag, Some(false)) {
         return None;
     }
@@ -1509,9 +1515,7 @@ fn extract_running_from_session(session: &Value) -> Option<(String, String)> {
         .and_then(|v| v.as_str())
         .or_else(|| obj.get("status").and_then(|v| v.as_str()))
         .or_else(|| obj.get("phase").and_then(|v| v.as_str()));
-    let status = raw_status
-        .map(normalize_agent_status)
-        .unwrap_or_else(|| "RUNNING".to_string());
+    let status = raw_status.map_or_else(|| "RUNNING".to_string(), normalize_agent_status);
     if !is_active_status(&status) {
         return None;
     }
@@ -1752,15 +1756,15 @@ fn read_stdin(tx: mpsc::Sender<GatewayMessage>) {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => {
-                let _ = tx.send(GatewayMessage::Status("stdin closed".to_string()));
+                drop(tx.send(GatewayMessage::Status("stdin closed".to_string())));
                 thread::sleep(Duration::from_millis(200));
             }
             Ok(_) => {
                 let trimmed = line.trim_end_matches(['\n', '\r']);
-                let _ = tx.send(GatewayMessage::Line(trimmed.to_string()));
+                drop(tx.send(GatewayMessage::Line(trimmed.to_string())));
             }
             Err(err) => {
-                let _ = tx.send(GatewayMessage::Status(format!("stdin error: {err}")));
+                drop(tx.send(GatewayMessage::Status(format!("stdin error: {err}"))));
                 thread::sleep(Duration::from_millis(200));
             }
         }
@@ -1784,7 +1788,7 @@ fn read_demo(tx: mpsc::Sender<GatewayMessage>) {
             "signal": rng.gen_range(-80..-40),
             "temperature": rng.gen_range(28.0..62.0),
         });
-        let _ = tx.send(GatewayMessage::Line(payload.to_string()));
+        drop(tx.send(GatewayMessage::Line(payload.to_string())));
         thread::sleep(Duration::from_millis(rng.gen_range(40..160)));
     }
 }
@@ -1880,8 +1884,7 @@ fn render_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let msg_rate = app.throughput_window.len() as u64;
     let last_event_age = app
         .last_event_at
-        .map(|t| format_duration(t.elapsed()))
-        .unwrap_or_else(|| "--".to_string());
+        .map_or_else(|| "--".to_string(), |t| format_duration(t.elapsed()));
 
     let mut top_types = app.types.iter().collect::<Vec<_>>();
     top_types.sort_by(|a, b| b.1.cmp(a.1));
@@ -2008,8 +2011,7 @@ fn render_health(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let last = app
         .gateway_health_at
-        .map(|at| format_duration(at.elapsed()))
-        .unwrap_or_else(|| "--".to_string());
+        .map_or_else(|| "--".to_string(), |at| format_duration(at.elapsed()));
     let status_line = Line::from(vec![
         Span::styled("Status: ", Style::default().fg(DIM)),
         Span::styled(health_label, health_style),
@@ -2036,25 +2038,25 @@ fn render_health(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .iter()
         .map(|(id, state)| (id.clone(), state.clone()))
         .collect::<Vec<_>>();
-    agents.sort_by(|a, b| b.1.last_at.cmp(&a.1.last_at));
+    agents.sort_by_key(|entry| std::cmp::Reverse(entry.1.last_at));
 
     let mut roots = agents
         .iter()
         .filter(|(id, _)| is_root_agent(id))
         .map(|(id, state)| (id.clone(), state.clone()))
         .collect::<Vec<_>>();
-    roots.sort_by(|a, b| b.1.last_at.cmp(&a.1.last_at));
+    roots.sort_by_key(|entry| std::cmp::Reverse(entry.1.last_at));
 
     let mut agent_lines: Vec<(String, String, String, Style)> = Vec::new();
     if roots.is_empty() {
-        for (id, state) in agents.iter() {
+        for (id, state) in &agents {
             let label = shorten_session_key(id);
             let age = format_duration(state.last_at.elapsed());
             let status_style = status_style_for(&state.status);
             agent_lines.push((label, state.status.clone(), age, status_style));
         }
     } else {
-        for (root_id, root_state) in roots.iter() {
+        for (root_id, root_state) in &roots {
             let label = strip_agent_prefix(&shorten_session_key(root_id));
             let age = format_duration(root_state.last_at.elapsed());
             agent_lines.push((
@@ -2074,7 +2076,7 @@ fn render_health(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 .filter(|(id, _)| id.starts_with(&root_prefix) && id.as_str() != root_id)
                 .map(|(id, state)| (id.clone(), state.clone()))
                 .collect::<Vec<_>>();
-            children.sort_by(|a, b| b.1.last_at.cmp(&a.1.last_at));
+            children.sort_by_key(|entry| std::cmp::Reverse(entry.1.last_at));
             for (idx, (child_id, child_state)) in children.iter().enumerate() {
                 let mut label = if child_id.starts_with(&root_prefix) {
                     child_id[root_prefix.len()..].to_string()

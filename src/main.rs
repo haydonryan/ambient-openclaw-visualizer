@@ -794,7 +794,7 @@ fn read_websocket(
             }
         };
 
-        let mut request = match parsed.into_client_request() {
+        let mut request = match parsed.as_str().into_client_request() {
             Ok(request) => request,
             Err(err) => {
                 send_status(&tx, debug, format!("Bad request: {err}"));
@@ -888,7 +888,7 @@ fn read_websocket(
                                             "[openclaw] connect params: client_id=cli, client_mode=cli, role=operator, scopes=operator.read,operator.write,operator.admin, device_id={device_id}"
                                         );
                                     }
-                                    match socket.send(Message::Text(message)) {
+                                    match socket.send(Message::Text(message.into())) {
                                         Ok(()) => {
                                             connect_sent = true;
                                             send_status(&tx, debug, "Sent connect request".into());
@@ -918,7 +918,7 @@ fn read_websocket(
                                         if !status_sent {
                                             let request_id = new_request_id();
                                             let message = build_status_request(&request_id);
-                                            match socket.send(Message::Text(message)) {
+                                            match socket.send(Message::Text(message.into())) {
                                                 Ok(()) => {
                                                     status_sent = true;
                                                     send_status(
@@ -945,7 +945,7 @@ fn read_websocket(
                                                 &request_id,
                                                 active_minutes,
                                             );
-                                            match socket.send(Message::Text(message)) {
+                                            match socket.send(Message::Text(message.into())) {
                                                 Ok(()) => {
                                                     sessions_sent = true;
                                                     send_status(
@@ -996,7 +996,7 @@ fn read_websocket(
                                     }
                                 }
                             }
-                            drop(tx.send(GatewayMessage::Line(text)));
+                            drop(tx.send(GatewayMessage::Line(text.to_string())));
                         }
                         Ok(Message::Binary(data)) => {
                             let preview = format!("binary:{} bytes", data.len());
@@ -1056,7 +1056,7 @@ fn handle_gateway_command(
         } => {
             let request_id = new_request_id();
             let payload = build_chat_send_request(&request_id, &session_key, &message);
-            match socket.send(Message::Text(payload)) {
+            match socket.send(Message::Text(payload.into())) {
                 Ok(()) => {
                     send_status(tx, debug, format!("Sent chat.send to {session_key}"));
                 }

@@ -9,7 +9,7 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dotenvy = "0.15"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-dirs = "5"
+dirs = "6"
 hex = "0.4"
 native-tls = "0.2"
 rand = "0.8"

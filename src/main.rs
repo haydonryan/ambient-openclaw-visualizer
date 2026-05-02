@@ -29,7 +29,7 @@ use crossterm::terminal::{
 };
 use crossterm::{cursor, execute};
 use ed25519_dalek::{Signer, SigningKey};
-use rand::Rng;
+use rand::prelude::*;
 use rand_core::OsRng;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;

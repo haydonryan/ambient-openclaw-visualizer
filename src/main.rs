@@ -29,8 +29,8 @@ use crossterm::terminal::{
 };
 use crossterm::{cursor, execute};
 use ed25519_dalek::{Signer, SigningKey};
+use getrandom::fill as fill_random;
 use rand::prelude::*;
-use rand_core::OsRng;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -1182,7 +1182,11 @@ fn load_or_create_device_identity() -> (String, SigningKey) {
         return (derive_device_id(&signing_key), signing_key);
     }
 
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let mut secret_key = [0_u8; 32];
+    if let Err(error) = fill_random(&mut secret_key) {
+        panic!("failed to generate device key: {error}");
+    }
+    let signing_key = SigningKey::from_bytes(&secret_key);
     let device_id = derive_device_id(&signing_key);
     let identity = DeviceIdentity {
         private_key: BASE64.encode(signing_key.to_bytes()),

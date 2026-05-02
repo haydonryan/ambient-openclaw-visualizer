@@ -30,7 +30,7 @@ use crossterm::terminal::{
 use crossterm::{cursor, execute};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::Rng;
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -1772,24 +1772,24 @@ fn read_stdin(tx: mpsc::Sender<GatewayMessage>) {
 }
 
 fn read_demo(tx: mpsc::Sender<GatewayMessage>) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let devices = ["alpha", "beta", "gamma", "delta", "omega"];
     let types = ["telemetry", "control", "heartbeat", "alert", "sync"];
     loop {
-        let device = devices[rng.gen_range(0..devices.len())];
-        let event_type = types[rng.gen_range(0..types.len())];
-        let latency = rng.gen_range(5.0..180.0);
-        let status = if rng.gen_bool(0.92) { "ok" } else { "error" };
+        let device = devices[rng.random_range(0..devices.len())];
+        let event_type = types[rng.random_range(0..types.len())];
+        let latency = rng.random_range(5.0..180.0);
+        let status = if rng.random_bool(0.92) { "ok" } else { "error" };
         let payload = serde_json::json!({
             "type": event_type,
             "status": status,
             "device_id": device,
             "latency_ms": latency,
-            "signal": rng.gen_range(-80..-40),
-            "temperature": rng.gen_range(28.0..62.0),
+            "signal": rng.random_range(-80..-40),
+            "temperature": rng.random_range(28.0..62.0),
         });
         drop(tx.send(GatewayMessage::Line(payload.to_string())));
-        thread::sleep(Duration::from_millis(rng.gen_range(40..160)));
+        thread::sleep(Duration::from_millis(rng.random_range(40..160)));
     }
 }
 

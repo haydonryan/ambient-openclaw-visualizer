@@ -39,3 +39,9 @@ install:
 
 run *args:
     cargo run --bin cyberpunk-openclaw-visualizer -- {{args}}
+
+benchmark:
+    ./scripts/benchmark.sh
+
+update:
+    ./scripts/update-dependencies.sh
